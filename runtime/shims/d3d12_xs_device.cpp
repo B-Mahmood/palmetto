@@ -164,6 +164,7 @@ const char* slot_name(unsigned slot) {
         case 14: return "CreateDescriptorHeap";
         case 16: return "CreateRootSignature";
         case 25: return "GetResourceAllocationInfo";
+        case 26: return "GetCustomHeapProperties";
         case 27: return "CreateCommittedResource (PC slot 27)";
         case 31: return "CreateSharedHandle (proxies unwrapped)";
         case 32: return "OpenSharedHandle (a fence comes back wrapped)";
@@ -1616,6 +1617,7 @@ static bool readable_range(const void* ptr, std::size_t bytes) {
         MEMORY_BASIC_INFORMATION mbi{};
         if (!VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
         const DWORD protect = mbi.Protect & 0xffu;
+    if (mbi.Protect & PAGE_GUARD) return false;  // a guard page faults on touch; masking it away hid that
         if (protect == PAGE_NOACCESS || protect == PAGE_GUARD || protect == PAGE_EXECUTE) return false;
         const auto base = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
         const auto addr = reinterpret_cast<std::uintptr_t>(p);
@@ -1908,6 +1910,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                                         static_cast<std::uint32_t>(a3), reinterpret_cast<const IID*>(a5),
                                                         reinterpret_cast<void**>(a6)));
     } else if constexpr (Slot == 26) {
+        note_slot(26);
         // GetCustomHeapProperties returns D3D12_HEAP_PROPERTIES by value. The retail executable passes the hidden
         // return buffer in RCX, which this thunk receives as `self`, and the device proxy in RDX (`a1`); a PC member
         // takes the device in RCX and the buffer in RDX. docs/retail_boot_chain.md section 3.1.
@@ -1927,18 +1930,29 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                 return reinterpret_cast<std::uint64_t>(self);
             }
         }
+        // PC order: the device is `self` and the hidden return buffer is `a1`. Fill it and return its address, so this
+        // branch can never fall off the end of the function (the regression the audit found, and the shape the
+        // GPU-free tests call).
+        if (a1) {
+            const D3D12_HEAP_PROPERTIES properties = self->real->GetCustomHeapProperties(
+                static_cast<UINT>(a2), static_cast<D3D12_HEAP_TYPE>(static_cast<std::uint32_t>(a3)));
+            std::memcpy(reinterpret_cast<void*>(a1), &properties, sizeof(properties));
+            return a1;
+        }
+        return 0;
     } else if constexpr (Slot == 70) {
+        note_slot(70);
         // The title hands its own console address as the output pointer for the placed resource. That range is not
         // backed in this process, so the layer's write faults. Back the page it lands in, then forward unchanged:
         // the call shape itself is ordinary (probed: self is the proxy, a1 is not).
         if (trace_enabled())
             std::fprintf(stderr, "[rt] d3d12_xs: slot 70 out=0x%llx back_fn=%d\n",
                          static_cast<unsigned long long>(a7), back_range_slot() ? 1 : 0);
+        if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
         if (a7 && back_range_slot()) {
             constexpr std::uint64_t page = 0x10000;
             back_range_slot()(static_cast<std::uint64_t>(a7) & ~(page - 1), page);
         }
-        if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
         using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
                                                  std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
                                                  std::uint64_t);
