@@ -22,7 +22,9 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <chrono>
 #include <map>
+#include <thread>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -262,6 +264,30 @@ int wmain(int argc, wchar_t** argv) {
         }
         std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);
+        // LEONIDA_WATCH_GLOBAL=<hex rva> logs every change of a mapped image's 8-byte global with the millisecond it
+        // happened, so a value the title stores and later dereferences can be traced to the call that produced it
+        // without a debugger. Polling is coarse but the log lines around it are ordered with it.
+        if (const DWORD size = GetEnvironmentVariableW(L"LEONIDA_WATCH_GLOBAL", nullptr, 0); size > 1) {
+            std::wstring value(size, L'\0');
+            const DWORD n = GetEnvironmentVariableW(L"LEONIDA_WATCH_GLOBAL", value.data(), size);
+            if (n > 0 && n < size) value.resize(n);
+            const auto rva = std::wcstoull(value.c_str(), nullptr, 16);
+            auto* const slot = reinterpret_cast<std::uint64_t*>(main_module.base + rva);
+            std::fprintf(stderr, "[rt] watching image+0x%llx (%p)\n",
+                         static_cast<unsigned long long>(rva), static_cast<void*>(slot));
+            std::thread([slot] {
+                std::uint64_t last = 0;
+                for (;;) {
+                    const std::uint64_t now = *slot;
+                    if (now != last) {
+                        std::fprintf(stderr, "[rt] watch: image global = 0x%llx\n",
+                                     static_cast<unsigned long long>(now));
+                        last = now;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            }).detach();
+        }
         const int code = rt::process::run_entry(main_module.base + main_module.entry_rva);
         std::fflush(stdout);
         std::printf("game exited with code %d\n", code);

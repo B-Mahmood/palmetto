@@ -183,7 +183,22 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                      ",\"address\":" + quote(hex(r.ExceptionInformation[1]));
             }
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
-            if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
+            if (info.ContextRecord) {
+                f += ",\"stack\":" + stack_from(*info.ContextRecord);
+                // LEONIDA_DUMP_REGS=1: the argument registers at the fault. A stop whose stack frame looks impossible
+                // (a null test that should have branched) is usually a jump into a shared tail, and the registers say
+                // which values the failing instruction actually saw.
+                static const bool dump_regs = GetEnvironmentVariableW(L"LEONIDA_DUMP_REGS", nullptr, 0) != 0;
+                if (dump_regs) {
+                    const CONTEXT& c = *info.ContextRecord;
+                    f += ",\"regs\":{";
+                    f += "\"rcx\":" + quote(hex(c.Rcx)) + ",\"rdx\":" + quote(hex(c.Rdx)) +
+                         ",\"r8\":" + quote(hex(c.R8)) + ",\"r9\":" + quote(hex(c.R9)) +
+                         ",\"rdi\":" + quote(hex(c.Rdi)) + ",\"rsi\":" + quote(hex(c.Rsi)) +
+                         ",\"rsp\":" + quote(hex(c.Rsp)) + ",\"rbp\":" + quote(hex(c.Rbp));
+                    f += "}";
+                }
+            }
             event("exception", f);
         }
     } catch (...) {
