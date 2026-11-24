@@ -181,3 +181,24 @@ actually asks for, and a translation that passes `spirv-val` is not by itself pr
 The 42 pipelines need specific programs among the untranslated ten. Getting there means finishing class 2 - making the
 repaired listing's instruction offsets agree with the blob for the inline-literal forms - and only then re-measuring.
 A partial set is measurably useless: it changes neither the failure count nor the stop.
+
+### The inline-literal class, measured
+
+After the repair tool was made non-invasive, the FidelityFX set translates 19 of 29 (program 07 is the new module) and
+program 03 has 15 of its words reconstructed instead of one. What remains is one class, and the translator names it with a
+single-bit difference:
+
+```
+v_dot4_i32_i8 at 0x13DC
+  the blob holds  34 40 16 cc 27 8d d1 0c
+  LLVM printed    34 40 16 cc 27 8d d1 1c
+```
+
+The last byte differs in one bit. That is a field the disassembler drops when it prints an encoding, not a misdecode:
+the instruction is right and the text lost a field. The translator refuses it rather than translating the field as zero,
+and rewriting the printed bytes to match the blob would defeat that refusal without making the translation correct, so
+the repair tool leaves these lines alone.
+
+Finishing this class means teaching the translator to read the dropped field from the blob for the VOP forms involved -
+the same shape as `mix_literal`, which already exists for other families - and then re-measuring. Until that is done the
+FidelityFX pipelines cannot be created, and the run stops where it has stopped since the pipelines were first reached.
