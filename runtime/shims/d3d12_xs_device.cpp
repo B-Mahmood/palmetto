@@ -1888,6 +1888,30 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_descriptor_heap(
             self, reinterpret_cast<const D3D12_DESCRIPTOR_HEAP_DESC*>(a1),
             reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
+    } else if constexpr (Slot == 61) {
+        // The console calls this slot with two arguments from 192 sites during pipeline setup, while the PC interface's
+        // slot 61 is CreateMetaCommand (three arguments): forwarding by number makes the layer read -1. Identify what
+        // the first argument points at before deciding what this slot is.
+        note_slot(61);
+        {
+            static std::atomic<bool> logged{false};
+            if (trace_enabled() && !logged.exchange(true, std::memory_order_relaxed)) {
+                std::fprintf(stderr, "[rt] slot 61 probe: a1=%p a2=0x%llx a3=%p a4=0x%llx\n",
+                             reinterpret_cast<void*>(a1), static_cast<unsigned long long>(a2),
+                             reinterpret_cast<void*>(a3), static_cast<unsigned long long>(a4));
+                if (a1 && readable_range(reinterpret_cast<const void*>(a1), 32)) {
+                    const auto* d = reinterpret_cast<const std::uint32_t*>(a1);
+                    std::fprintf(stderr, "[rt] slot 61 first words: %08x %08x %08x %08x | %08x %08x %08x %08x\n",
+                                 d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+                } else {
+                    std::fprintf(stderr, "[rt] slot 61: a1 is not readable\n");
+                }
+            }
+        }
+        // The first argument holds small integers rather than a graphics pipeline description, and the second is a
+        // title address, so this is not the PC CreateMetaCommand the slot number would forward to. Refuse instead of
+        // calling a method with the wrong arity; the probe above already names the arguments.
+        return hr_to_u64(E_NOTIMPL);
     } else if constexpr (Slot == 62) {
         return hr_to_u64(proxy_create_compute_pipeline_state(
             self, reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1), a2, a3,
