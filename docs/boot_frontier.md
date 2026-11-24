@@ -124,14 +124,20 @@ re-anchoring skipped 1 range: 0x4F08..0x4F0C (4 bytes)
 0x4F0C  28 2c 14 1a                <- code resumes here
 ```
 
-Nothing branches to 0x4F08, so the path arrives by fall-through from the scalar load at 0x4F00. Two facts make that
-suspicious rather than decisive:
+Nothing branches to 0x4F08, so the path arrives by fall-through from the scalar load at 0x4F00, and the two loads before
+it carry `s_clause`, whose whole purpose is to bundle consecutive scalar loads: the stream really does look like a run of
+loads, with one member of the run undecodable.
 
-* the two loads before it carry `s_clause`, whose whole purpose is to bundle consecutive scalar loads, arguing that the
-  stream is genuinely a run of loads;
-* the listing's own next instruction after that region is a load encoding (`0x0817…0038`) whose bytes do not appear at
-  that offset in the blob, so the listing and the blob already disagree about this neighbourhood.
+An earlier version of this note claimed the listing and the blob disagreed about that neighbourhood, because a load
+encoding seen nearby was not at that offset in the blob. That was wrong: the encoding occurs exactly once in the blob, at
+0x509C, as an ordinary instruction elsewhere in the same program. The listing and the blob agree; only the one word at
+0x4F08 is undecodable.
 
-The next step is to settle that disagreement - which of the two byte sequences the console actually executes, and why the
-disassembler's re-anchor chose the one it did - because the answer decides whether the fix is in decoding or in the
-control-flow walk. Everything above is reproducible from the listing and the blob with `tools/` alone.
+The program's own metadata says it is a wave32 compute program with 64 VGPRs, 14 user SGPRs and 4 KiB of LDS. The
+destination the undecodable word names would be `s[100:107]`, past the scalar-register file that every RDNA2 target LLVM
+models allows, which is why it decodes as invalid while its neighbours decode.
+
+That leaves one question worth answering before more work: whether the console accepts a destination that LLVM's register
+model forbids (a gfx1013 difference), or the word is not that instruction at all and the opcode byte means something
+else on this part. The first would need the disassembler to accept a wider register file; the second would need the
+opcode identified. Both are reproducible from the listing and the blob with `tools/` alone.
