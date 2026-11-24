@@ -1897,6 +1897,30 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                                         reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2),
                                                         static_cast<std::uint32_t>(a3), reinterpret_cast<const IID*>(a5),
                                                         reinterpret_cast<void**>(a6)));
+    } else if constexpr (Slot == 25) {
+        // GetResourceAllocationInfo returns D3D12_RESOURCE_ALLOCATION_INFO (16 bytes) by value: the same class as
+        // slot 26 (docs/boot_audit.md A1). The console order puts the hidden return buffer in RCX, which this thunk
+        // receives as `self`, and the device proxy in RDX (`a1`).
+        note_slot(25);
+        if (is_device_proxy(reinterpret_cast<const void*>(a1))) {
+            auto* device = reinterpret_cast<DeviceProxy*>(a1);
+            if (device->real && device->real_vtable) {
+                const D3D12_RESOURCE_ALLOCATION_INFO info = device->real->GetResourceAllocationInfo(
+                    static_cast<UINT>(a2), static_cast<UINT>(a3),
+                    reinterpret_cast<const D3D12_RESOURCE_DESC*>(a4));
+                std::memcpy(reinterpret_cast<void*>(self), &info, sizeof(info));
+                return reinterpret_cast<std::uint64_t>(self);
+            }
+        }
+        // PC order: the device is `self`, the hidden return buffer is a1.
+        if (a1) {
+            const D3D12_RESOURCE_ALLOCATION_INFO info = self->real->GetResourceAllocationInfo(
+                static_cast<UINT>(a2), static_cast<UINT>(a3),
+                reinterpret_cast<const D3D12_RESOURCE_DESC*>(a4));
+            std::memcpy(reinterpret_cast<void*>(a1), &info, sizeof(info));
+            return a1;
+        }
+        return 0;
     } else if constexpr (Slot == 26) {
         note_slot(26);
         // GetCustomHeapProperties returns D3D12_HEAP_PROPERTIES by value. The retail executable passes the hidden
@@ -1930,17 +1954,19 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return 0;
     } else if constexpr (Slot == 70) {
         note_slot(70);
-        // The console's placed-resource call names its heap by address, and the other arguments do not follow the PC
-        // shape either (a probe shows a pointer where the description belongs and an address inside the title's own
-        // image where the output belongs). Do not guess and do not back anything: an address that falls inside the
-        // mapped image cannot be given pagefile memory without overwriting the title's code. Forward as before and
-        // let the layer answer.
-        if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
-        using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
-                                                 std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
-                                                 std::uint64_t);
-        auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Slot]);
-        return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8);
+        // Measured from the title's own call site (a small thunk that loads the device from a global and then does
+        // `mov rdx, rcx; mov r8, rdx; mov r9, r8; call [rax+0x230]`): the console calls this slot with THREE arguments,
+        // not the seven PC CreatePlacedResource1 takes. Forwarding it by number therefore handed that method the
+        // leftovers of four unrelated registers as its description, state, clear, riid and out pointers, and its first
+        // write went to an address inside the title's own image. Until the three-argument shape is identified, refuse
+        // this slot instead of calling a method with the wrong arity.
+        if (trace_enabled())
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: device slot 70 called with 3 arguments (0x%llx, 0x%llx, 0x%llx); the console "
+                         "shape is not the PC CreatePlacedResource1 one, refusing\n",
+                         static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                         static_cast<unsigned long long>(a3));
+        return hr_to_u64(E_NOTIMPL);
     } else if constexpr (Slot == 76) {
         return hr_to_u64(proxy_create_resource(
             self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1),
@@ -2145,7 +2171,7 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 }
 
 bool device_slot_overridden(unsigned slot) {
-    if (slot <= 2 || slot == 26 || slot == 8 || slot == 9 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
+    if (slot <= 2 || slot == 25 || slot == 26 || slot == 8 || slot == 9 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
         slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
         slot == 75 || slot == 76 || slot == 133)
         return true;
