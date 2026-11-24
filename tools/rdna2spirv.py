@@ -15969,6 +15969,42 @@ def assemble(gen):
         for c in range(gen.cs["tid"] + 1):
             fn += [f"%li{c} = OpCompositeExtract %uint %lci {c}",
                    f"%lip{c} = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(c)}", f"OpStore %lip{c} %li{c}"]
+        if gen.cs.get("tg_size"):
+            # Work-Group Info (COMPUTE_PGM_RSRC2 TG_SIZE_EN, see check_workgroup_info_use): bits 11:6 are this
+            # wave's index in the workgroup and bits 5:0 the workgroup's wavefront count. The wave index is the
+            # local invocation index divided by the wave size; taking it from LocalInvocationId rather than from
+            # a subgroup builtin keeps it the program's wave (64 lanes) on any device subgroup size.
+            sx_, sy_, sz_ = gen.cs["size"]
+            fn += ["%tgs_x = OpCompositeExtract %uint %lci 0"]
+            terms = ["%tgs_x"]
+            if sy_ > 1:
+                fn += ["%tgs_y = OpCompositeExtract %uint %lci 1"]
+                if sx_ > 1:
+                    fn += [f"%tgs_yw = OpIMul %uint %tgs_y {gen.cu(sx_)}"]
+                    terms.append("%tgs_yw")
+                else:
+                    terms.append("%tgs_y")
+            if sz_ > 1:
+                fn += ["%tgs_z = OpCompositeExtract %uint %lci 2"]
+                if sx_ * sy_ > 1:
+                    fn += [f"%tgs_zw = OpIMul %uint %tgs_z {gen.cu(sx_ * sy_)}"]
+                    terms.append("%tgs_zw")
+                else:
+                    terms.append("%tgs_z")
+            lin = terms[0]
+            for k, term in enumerate(terms[1:], start=1):
+                fn += [f"%tgs_l{k} = OpIAdd %uint {lin} {term}"]
+                lin = f"%tgs_l{k}"
+            wave_size = 64 if gen.wave64 else 32
+            fn += [f"%tgs_w = OpShiftRightLogical %uint {lin} {gen.cu(wave_size.bit_length() - 1)}",
+                   f"%tgs_v = OpShiftLeftLogical %uint %tgs_w {gen.cu(6)}"]
+            value = "%tgs_v"
+            waves = -(-(sx_ * sy_ * sz_) // wave_size)
+            if waves > 1:
+                fn += [f"%tgs_v2 = OpBitwiseOr %uint %tgs_v {gen.cu(waves)}"]
+                value = "%tgs_v2"
+            r = gen.cs["user"] + len(gen.cs["tgid"])
+            fn += [f"%tgs_p = OpAccessChain %_ptr_Function_uint %sgpr {gen.cu(r)}", f"OpStore %tgs_p {value}"]
     if gen.frag_inputs:
         fn += ["%fc = OpLoad %v4float %frag_coord"]
         if bary:
@@ -16356,9 +16392,13 @@ def stage_of(name, path):
     # No index row (a shard re-run writes beside no index): the stage is in the name, but not always at offset 2.
     # Shader names can begin with a prefix that is not part of the stage, e.g. "3reflect_inst_CS_...",
     # "5PS_MirrorReflection...", ",smh_sim_0_CS_...", so look for a stage token anywhere rather than at name[:2].
-    match = re.search(r'(?:^|[_,\-0-9])(vs|ps|cs|gs|ms|hs|ds|as|lib)_', name, re.IGNORECASE)
+    match = re.search(r'(?:^|[_,\-0-9])(vs|ps|cs|gs|ms|hs|ds|as)_', name, re.IGNORECASE)
     if match:
         return match.group(1).lower()
+    # A pipeline-library program is named "lib_<stage>_<n>" (docs/shader_library.md): "lib_" is a prefix, not the
+    # stage, so it only answers when no stage token follows it.
+    if re.search(r'(?:^|[_,\-0-9])lib_', name, re.IGNORECASE):
+        return "lib"
     if name[2:3] == "_":
         return name[:2].lower()
     return "?"
@@ -17338,6 +17378,45 @@ def cs_dispatch_state(path, name):
     return (m["rsrc2"], *m["threads"])
 
 
+TG_SIZE_MASK = 0xFC0     # Work-Group Info bits 11:6: this wave's index in the workgroup, in units of 64 lanes
+
+
+def check_workgroup_info_use(insns, reg):
+    """True if ``insns`` read the RSRC2 TG_SIZE_EN work-group-info SGPR ``reg`` through the one idiom modelled here.
+
+    COMPUTE_PGM_RSRC2 TG_SIZE_EN [10] makes the hardware set a system SGPR with the work-group info; no FSSM compute
+    shader sets the bit, but the pipeline library's compute programs do (docs/shader_library.md). The idiom the
+    boot's programs use is the wave64 local-invocation-index computation: Mesa's
+    src/amd/common/nir/ac_nir_lower_intrinsics_to_args.c lowers LocalInvocationIndex to
+    `mbcnt(~0, tg_size & 0xfc0)` and its comment says the AND leaves the wave index multiplied by 64, so bits 11:6
+    hold this wave's index in the workgroup and bits 5:0 its wavefront count (LLVM docs/AMDGPUUsage, "Work-Group
+    Info"). Any other read of the register, and any use of the masked value other than v_mbcnt_lo/hi_u32_b32, is
+    refused: the remaining fields are not modelled, and a value invented for them would be a guess."""
+    found = False
+    for n, ins in enumerate(insns):
+        a, op = ins["args"], base_op(ins["op"])
+        if not any(x["k"] == "sgpr" and x.get("r", 1 << 30) <= reg < x.get("r", 0) + x.get("n", 1) for x in a):
+            continue
+        if not (op == "s_and_b32" and len(a) == 3 and
+                a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1 and
+                a[1]["k"] == "sgpr" and a[1].get("r") == reg and a[1].get("n", 1) == 1 and
+                a[2]["k"] == "imm" and a[2]["v"] & 0xFFFFFFFF == TG_SIZE_MASK):
+            raise Unsupported("CS work-group-info SGPR use")
+        dest = a[0]["r"]
+        for nxt in insns[n + 1:]:
+            mentions = [x for x in nxt["args"]
+                        if x["k"] == "sgpr" and x.get("r", 1 << 30) <= dest < x.get("r", 0) + x.get("n", 1)]
+            if not mentions:
+                continue
+            if base_op(nxt["op"]) in ("v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32"):
+                found = True
+                break
+            if nxt["args"] and nxt["args"][0]["k"] == "sgpr" and mentions[0] is nxt["args"][0]:
+                break                    # overwritten before use: no dependence on the value
+            raise Unsupported("CS work-group-info SGPR use")
+    return found
+
+
 def fspx_wave_size(path, name):
     """32 or 64 from an FSPX program's dispatch state, or None: the `wave32` field tools/fspx_unpack.py writes to
     fspx/<name>.json from kind 0's word 4 bit 20 (set = wave32; docs/fspx.md, "Kind 0: dispatch state"). None when
@@ -17534,13 +17613,18 @@ def translate(path):
         # (separate VGPRs on GFX10). An FSPX program (the FidelityFX DLL's shaders) carries the same two fields in its
         # kind-0 entry (docs/fspx.md).
         rsrc2, lx, ly, lz = cs_dispatch_state(path, info["name"])
-        if (rsrc2 >> 10) & 1:
-            raise Unsupported("CS thread-group-size SGPR")
         if not (1 <= lx * ly * lz <= 1024):
             raise Unsupported("CS group size")
         user = (rsrc2 >> 1) & 31
         g.cs = {"user": user, "tgid": [c for c in range(3) if (rsrc2 >> (7 + c)) & 1],
                 "tid": (rsrc2 >> 11) & 3, "size": (lx, ly, lz)}
+        if (rsrc2 >> 10) & 1:
+            # TG_SIZE_EN: the hardware fills a work-group-info system SGPR right after the enabled workgroup-id
+            # SGPRs. Only the wave64 local-invocation-index idiom is modelled (check_workgroup_info_use); a program
+            # that reads the register any other way is refused rather than translated with a guessed value.
+            if not g.wave64:
+                raise Unsupported("CS work-group-info SGPR on wave32")
+            g.cs["tg_size"] = check_workgroup_info_use(insns, user + len(g.cs["tgid"]))
         # LDS_SIZE [23:15] in 512-byte units. All 485 LDS-using corpus CS stay inside it; a constant offset past it,
         # which RDNA2 treats as out of range, is bounds-checked below (SHADER-309).
         need = ((rsrc2 >> 15) & 0x1FF) * 128
