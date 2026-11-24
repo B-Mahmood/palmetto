@@ -19,8 +19,12 @@ The run reaches **2,238 D3D12 calls** and stops at the third row.
 
 Two facts about the first two rows matter for planning:
 
-* The title **continues** when a compute pipeline cannot be created, so the FSPX gap breaks rendering rather than the
-  boot; it is not the current stop.
+* The title does **not** survive a failed compute pipeline. Full slot tracing shows the run reaching device slot 62 once
+  more after the 42 refusals and then calling through a null pointer (`access execute` at 0x0), so the FSPX gap stops
+  the boot and is not merely a rendering problem. An earlier reading of the same run - that the title continued past
+  the failures - came from the slot log without full tracing and was wrong.
+* The lookup key is the SHA-256 of the kind-6 program bytes the title passes in the pipeline description, so a pipeline
+  can only be created when that exact program has a translated module.
 * The runtime's shader library scans only its top directory. The FSPX and XboxBvhBuilder sets must sit beside
   `index.json`, not in the `bvh/` and `fspx/` subdirectories the builder writes, or every lookup misses.
 
