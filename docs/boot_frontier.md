@@ -25,8 +25,8 @@ Two facts about the first two rows matter for planning:
   the failures - came from the slot log without full tracing and was wrong.
 * The lookup key is the SHA-256 of the kind-6 program bytes the title passes in the pipeline description, so a pipeline
   can only be created when that exact program has a translated module.
-* The runtime's shader library scans only its top directory. The FSPX and XboxBvhBuilder sets must sit beside
-  `index.json`, not in the `bvh/` and `fspx/` subdirectories the builder writes, or every lookup misses.
+* The shader library loads `<dir>/index.json` and then the `fspx/` and `bvh/` indexes beneath it, so the builder's
+  subdirectories are found as written. An earlier note here claimed the opposite; it was wrong.
 
 ## Outstanding assertion
 
@@ -43,3 +43,32 @@ assertion: skipping it lets the boot run on into pipeline creation, so it is hid
   Slots past the PC table are console extensions: they are stubbed with S_OK / 0 and named in the log.
 * A console heap address is a 64 KiB-aligned title VA; any other value where an extended description would carry one
   is a field that happens to sit there, and treating it as an address takes the heap out of the arena.
+
+## The FSPX translation gap, measured
+
+The 29 FidelityFX programs unpack and disassemble, and 18 translate. The 11 that do not are refused by the translator
+with `fall-through into undecodable words`: a reachable instruction runs into words the disassembler skipped, so the
+path's later stores and exports would be dropped without a word.
+
+| program | bytes | undecodable words |
+|---|---:|---:|
+| 03 | 10,156 | 9 |
+| 04 | 16,696 | 9 |
+| 05 | 17,040 | 27 |
+| 06 | 41,300 | 155 |
+| 07 | 21,620 | **1** |
+| 08 | 25,508 | 10 |
+| 09 | 25,972 | 32 |
+| 12 | 8,656 | 8 |
+| 15 | 22,272 | 8 |
+| 18 | 8,600 | 8 |
+| 28 | 13,724 | 55 |
+
+The skipped words sit in the listing as gaps: program 07 has one, at +0x4EE4 (`08 19 2c f4`); programs 12 and 18 have
+eight each, all of the form `xx 50 16 cc` (`19 50 16 cc`, `1a 50 16 cc`, `21 50 16 cc`, ...). LLVM's AMDGPU disassembler
+refuses every one of them as `invalid instruction encoding` for `gfx1030`, `gfx1013`, `gfx1010`, `gfx1011` and `gfx1012`,
+which points at an alignment problem in the listing rather than a missing opcode family: one mis-sized instruction
+earlier in the stream would leave exactly this kind of short, repeated remnant.
+
+That is the next thing to fix, and it is the only thing standing between the runtime and the compute pipelines the title
+requires before it draws.
