@@ -176,3 +176,15 @@ None of the programs has been run on a GPU.
   be compared with the translated FSSM shader of the same pipeline.
 * **Not decoded.** The graphics state blob, the 40 bytes in each graphics record, the compute kind-1 blob, the
   records inside the stage blobs, and slot 6.
+
+## 7. Build and run-time lookup
+
+`make_game.py`'s shaders stage runs `library_shaders` after the game's shaders and the two DLL steps: it unpacks the
+library's compute programs with `shader_library.py --stages cs --disasm` into `<work>/shaders/library` (programs,
+`.json` and `.state` sidecars in `fspx/`, listings in `disasm/`) and translates them into
+`<work>/shaders/spirv/library`. The runtime's shader library loads `<shaders>/library/index.json` beside `fspx/` and
+`bvh/`, with entries named `library/<name>`, and finds a program by `fspx_code_sha256` and `fspx_state_sha256` as it
+finds an FSPX program. Not every library program translates and only those a pipeline asks for are needed, so the step
+keeps a partial index and logs the count; an index with none fails the step. It runs again when the carve of
+`shaders.rpf`, the unpacking or translating tools, llvm-mc, the wave64 mode or the fallback flags change
+(`library_build.json`). The graphics programs are left out of this step.

@@ -223,7 +223,10 @@ and stops inside the title itself.
 Three consequences for anyone continuing:
 
 * `tools/shader_library.py` now writes `<name>.state`; a pipeline cannot resolve without it;
-* nothing in `make_game.py` runs the pipeline-library step yet, so a fresh build still reproduces the old failure;
+* `make_game.py`'s shaders stage now runs the pipeline-library step (`library_shaders`): `shader_library.py --stages cs
+  --disasm` into `<work>/shaders/library`, translated into `<work>/shaders/spirv/library`, which the runtime's shader
+  library loads beside `fspx/` and `bvh/` (entries named `library/<name>`). Not yet re-measured from a fresh build;
+  before it, a fresh build reproduced the old failure;
 * `tools/rdna2spirv.py`'s stage fallback reads `lib_cs_*` as stage `lib`, so a library listing needs an `index.json`
   beside it (or the fallback fixed) or it is refused as an unknown stage.
 

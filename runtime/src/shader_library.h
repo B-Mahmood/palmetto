@@ -829,9 +829,12 @@ public:
     // when it is there:
     //   - <dir>/fspx/index.json, the FidelityFX DLL's FSPX programs, entries named "fspx/<name>" (docs/fspx.md);
     //   - <dir>/bvh/index.json, XboxBvhBuilder.dll's FSSM programs, entries named "bvh/<name>" and found by
-    //     fssm_sha256 like the game's own shaders (docs/embedded_shaders.md).
-    // Entries with neither fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. Both folders
-    // are optional: a missing or unreadable index there leaves the main one, and the other folder's, loaded.
+    //     fssm_sha256 like the game's own shaders (docs/embedded_shaders.md);
+    //   - <dir>/library/index.json, the compute programs of the pipeline library inside shaders.rpf, entries named
+    //     "library/<name>" and found by fspx_code_sha256 and fspx_state_sha256 like an FSPX program
+    //     (docs/shader_library.md): the title's own DeserializeComputePipelineStateX pipelines.
+    // Entries with neither fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. All three
+    // folders are optional: a missing or unreadable index there leaves the main one, and the others', loaded.
     bool load(const std::filesystem::path& dir, std::string* error = nullptr) {
         const auto fail = [&](const std::string& why) {
             if (error) *error = why;
@@ -849,7 +852,7 @@ public:
         } catch (...) {
             return fail("index.json could not be read");
         }
-        for (const char* sub_folder : {"fspx", "bvh"}) {
+        for (const char* sub_folder : {"fspx", "bvh", "library"}) {
             try {
                 const auto ignore = [](const std::string&) { return false; };
                 const std::filesystem::path sub = folder / sub_folder;
@@ -871,6 +874,9 @@ public:
     // Entries loaded from <dir>/bvh/index.json. No RPF container reaches these either: XboxBvhBuilder.dll passes
     // their containers itself.
     std::size_t bvh_size() const { return bvh_count_; }
+    // Entries loaded from <dir>/library/index.json. No RPF container reaches these either: the title deserializes
+    // their pipelines from the library itself.
+    std::size_t library_size() const { return library_count_; }
 
     // The first entry for this program. Two containers can hold the same FSSM program with different input
     // signatures; `candidates` returns all of them.
@@ -978,6 +984,7 @@ private:
             count_ = 0;
             fspx_count_ = 0;
             bvh_count_ = 0;
+            library_count_ = 0;
         }
         for (const auto& [name, meta] : root.object) {
             const Json* hash = meta.find("fssm_sha256");
@@ -1043,6 +1050,7 @@ private:
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
             if (by_fspx && prefix == "fspx/") ++fspx_count_;
             if (prefix == "bvh/") ++bvh_count_;
+            if (prefix == "library/") ++library_count_;
             ++count_;
         }
         return true;
@@ -1052,6 +1060,7 @@ private:
     std::size_t count_ = 0;
     std::size_t fspx_count_ = 0;
     std::size_t bvh_count_ = 0;
+    std::size_t library_count_ = 0;
     // Entries by (stage, fssm_sha256) and by (stage, fspx_code_sha256), in index order.
     Entries entries_;
     Entries fspx_entries_;

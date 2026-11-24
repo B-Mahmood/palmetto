@@ -827,6 +827,62 @@ int main() {
         std::filesystem::remove_all(dir);
     }
 
+    // The pipeline library's compute programs (docs/shader_library.md): the title's own precompiled pipelines,
+    // written in the FSPX layout by tools/shader_library.py, translated into <dir>/library (entries named
+    // "library/<name>") and found by fspx_code_sha256 and fspx_state_sha256 like an FSPX program.
+    {
+        const auto code = fspx_code(0x6000);
+        const auto upscaler = fspx_code(0x5000);
+        std::vector<std::uint8_t> state(28, 0);
+        state[12] = 8;  // word 3: NumThreadsX
+        std::vector<std::uint8_t> other_state = state;
+        other_state[12] = 16;
+        const auto n = std::uint32_t(code.size());
+        const auto with_state = [&](const std::vector<std::uint8_t>& s) {
+            std::vector<std::uint8_t> body = s;
+            body.insert(body.end(), code.begin(), code.end());
+            return accc_container(fspx_payload({{0, 48, 28}, {6, 48 + 28, n}}, body));
+        };
+        const std::uint32_t words[5] = {0x07230203, 0x00010500, 0, 1, 0};
+        const auto write = [&](const std::filesystem::path& file, const std::string& text) {
+            std::ofstream out(file, std::ios::binary | std::ios::trunc);
+            out << text;
+        };
+        std::filesystem::create_directories(dir / "fspx");
+        std::filesystem::create_directories(dir / "library");
+        write(dir / "index.json", "{\"cs_game\": {\"stage\": \"cs\", \"fssm_sha256\": \"" + hash + "\"}}");
+        write(dir / "fspx" / "index.json",
+              "{\"upscaler_00\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" + sha256_hex(upscaler) + "\"}}");
+        // The second entry is a program the translator refused: no key, so nothing finds it and it is not counted.
+        write(dir / "library" / "index.json",
+              "{\"lib_cs_00003\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" + sha256_hex(code) +
+                  "\", \"fspx_state_sha256\": \"" + sha256_hex(state) + "\"},\n"
+                  " \"lib_cs_00004\": {\"error\": \"Unsupported: synthetic\"}}");
+        {
+            std::ofstream spv(dir / "library" / "lib_cs_00003.spv", std::ios::binary);
+            spv.write(reinterpret_cast<const char*>(words), sizeof(words));
+        }
+        ShaderLibrary lib;
+        CHECK(lib.load(dir.string(), &error) && lib.size() == 3 && lib.library_size() == 1 &&
+              lib.fspx_size() == 1 && lib.bvh_size() == 0);
+        // The pipeline description carries the program and its kind-0 state: found by both keys.
+        const auto found = lib.program_candidates("cs", compute_program(with_state(state)));
+        CHECK(found.size() == 1 && found[0]->name == "library/lib_cs_00003");
+        CHECK(lib.spirv(*found[0]).size() == 5);  // <dir>/library/lib_cs_00003.spv
+        CHECK(lib.program_candidates("cs", compute_program(code)) == found);  // one module for the code key
+        CHECK(lib.program_candidates("cs", compute_program(with_state(other_state))).empty());
+        // The other indexes are untouched.
+        CHECK(lib.find("cs", hash) && lib.find("cs", hash)->name == "cs_game");
+        CHECK(lib.program_candidates("cs", compute_program(upscaler)).at(0)->name == "fspx/upscaler_00");
+        // A broken library/index.json leaves the main index and the FSPX one loaded; a missing one is not an error.
+        write(dir / "library" / "index.json", "{broken");
+        CHECK(lib.load(dir.string(), &error) && lib.size() == 2 && lib.library_size() == 0 && lib.fspx_size() == 1 &&
+              lib.program_candidates("cs", compute_program(code)).empty());
+        std::filesystem::remove(dir / "library" / "index.json");
+        CHECK(lib.load(dir.string(), &error) && lib.size() == 2 && lib.library_size() == 0 && lib.find("cs", hash));
+        std::filesystem::remove_all(dir);
+    }
+
     // The review case on #1911: one kind-6 program in two containers whose kind-0 entries differ (32x1x1 and
     // 64x1x1), translated to two different modules. A container picks its own entry by fspx_state_sha256; a bare
     // kind-6 program cannot tell them apart and is refused as ambiguous; with one module for the key it is accepted.

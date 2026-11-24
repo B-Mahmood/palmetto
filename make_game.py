@@ -21,7 +21,8 @@ it is missing. Never share what it makes.
 Stages (each skips work that is already done, so a stopped build continues where it left off):
     check     always first: file names and sizes against game/<version>.json (add --full-check for SHA-256, slow)
     shaders   carve shaders.rpf, unpack the native RDNA2 code, disassemble, translate to SPIR-V; then the same for the
-              compute programs inside amd_fidelityfx_upscaler_xbox.dll and XboxBvhBuilder.dll
+              compute programs inside amd_fidelityfx_upscaler_xbox.dll and XboxBvhBuilder.dll and of the pipeline
+              library inside shaders.rpf
     assets    models (OBJ), texture dictionaries and texture pools (DDS), audio banks (AWC; --wav adds PCM WAV)
               BCPack uses strict decoding by default. For local calibration use <work>/bcpack-calibration.json.
     runtime   build the loader (needs the game's executable to run, not to build). On Linux it is cross-built with
@@ -1318,6 +1319,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     verify_translation_completeness(dxbc, spirv)
     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
+    library_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
     log("shaders: done")
 
 
@@ -1532,6 +1534,75 @@ def bvh_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate:
         fail(f"shaders: none of the {BVH_DLL} programs translated, so their index is not kept. Run the shaders "
              "stage again; if it happens again, the tool output above is why.")
     bvh_report(programs)
+    with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
+        f.write(settings + "\n")
+
+
+LIBRARY_TOOLS = ("shader_library.py", "fspx_unpack.py", "shader_disasm.py")   # as FSPX_TOOLS, for the library
+
+
+def library_settings(carved: str, mc_signature: str, emulate: bool, fallbacks: tuple[str, ...]) -> str:
+    """What the pipeline library's outputs depend on, as one line: the carve of shaders.rpf (its index stands for the
+    archive: shaders() carves again only when it is gone, and hashing the archive itself would read gigabytes on
+    every build), the unpacking and translating tools, llvm-mc, the wave64 mode and the fallback flags."""
+    tools = hashlib.sha256()
+    for name in LIBRARY_TOOLS:
+        tools.update(f"{name}\0".encode() + bytes.fromhex(file_sha256(os.path.join(TOOLS, name))))
+    return json.dumps({"carve": file_sha256(carved), "tools": tools.hexdigest(),
+                       "translator": translation_sources_digest(), "llvm_mc": mc_signature,
+                       "wave64_emulate": bool(emulate), "fallbacks": list(fallbacks)}, sort_keys=True)
+
+
+def library_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate: bool = False,
+                    fallbacks: tuple[str, ...] = ()) -> None:
+    """The compute programs of the pipeline library inside shaders.rpf (docs/shader_library.md), the title's own
+    precompiled compute pipelines: tools/shader_library.py unpacks and disassembles them into <work>/shaders/library
+    with their kind-0 state sidecars, and rdna2spirv.py translates them into <work>/shaders/spirv/library, where the
+    runtime's shader library finds them by fspx_code_sha256 and fspx_state_sha256 like an FSPX program. Without this
+    step every DeserializeComputePipelineStateX the boot makes fails (docs/boot_frontier.md, "Correction: the
+    refused pipelines are the title's own").
+
+    Not every library program translates, and only those a pipeline asks for are needed, so a partial index is kept
+    and the count is logged; an index with none fails the step (translate()). Reuse requires the translation index,
+    its named modules and a matching library_build.json (library_settings)."""
+    src = os.path.join(game, "shaders.rpf")
+    carved = os.path.join(work, "shaders", "dxbc", "index.json")
+    unpacked = os.path.join(work, "shaders", "library")
+    spirv = os.path.join(work, "shaders", "spirv", "library")
+    translated = os.path.join(spirv, "index.json")
+    settings_file = os.path.join(spirv, "library_build.json")
+    if not os.path.isfile(src) or not os.path.isfile(carved):
+        # The runtime loads <shaders>/library/index.json whenever it is there, so an index from another package
+        # must not stay behind.
+        drop(translated, settings_file)
+        log("shaders: no carved shaders.rpf, so no pipeline library to translate")
+        return
+    settings = library_settings(carved, mc_signature, emulate, fallbacks)
+    if read_shader_setting(settings_file) == settings and fspx_cache_complete(spirv):
+        return
+    log("shaders: unpacking and translating the compute programs of the pipeline library in shaders.rpf")
+    drop(translated, settings_file)
+    # A program that no longer translates, or one from another archive, must not keep a listing or a module.
+    for folder, suffixes in ((os.path.join(unpacked, "disasm"), (".s",)), (spirv, (".spv", ".spvasm"))):
+        if os.path.isdir(folder):
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    if entry.name.endswith(suffixes) and entry.is_file(follow_symlinks=False):
+                        os.unlink(entry.path)
+    disasm = os.path.join(unpacked, "disasm")
+    py("shader_library.py", src, "--out", unpacked, "--stages", "cs", "--disasm", "--jobs", jobs)
+    translate(disasm, spirv, jobs, emulate=emulate, fallbacks=fallbacks)
+    clash = fspx_key_clash(spirv)
+    if clash:
+        drop(translated)   # the runtime must not load an index whose keys pick between different modules
+        fail(f"shaders: library programs {clash[0]} and {clash[1]} have the same code and state "
+             "(fspx_code_sha256 and fspx_state_sha256) but different translated modules, so the runtime could not "
+             "tell which one a pipeline means")
+    with open(translated, encoding="utf-8") as f:
+        done = len(json.load(f))
+    listed = len(disassembly_listings(unpacked) or ())
+    log(f"shaders: {done} of {listed} pipeline-library compute programs translated (the rest are refused; the "
+        "runtime needs only those a pipeline asks for, and names any it cannot find)")
     with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
         f.write(settings + "\n")
 
