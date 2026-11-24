@@ -249,3 +249,20 @@ runtime either refused or answered without an object. Candidates measured in the
 
 The next step is to find which of those results the title stores in that global - by logging the arguments of the
 beyond-table stubs and the value each caller keeps - rather than guessing at the crash site itself.
+
+## The streaming gap was hiding most of the boot
+
+The DirectStorage shim refused a request's zlib stage with `E_NOTIMPL`. Once it inflates it - the runtime already had
+`zlib_inflate` for the asset tools' format, so nothing new was vendored - the boot goes much further before the same
+stop: **2,238 -> 11,894 D3D12 calls**, the `not implemented` line disappears, and no zlib request fails. The wall-clock
+time grows from about 14 s to 17-19 s for the same reason.
+
+Two things this settles:
+
+* a refused streaming stage does not stop the title, it *starves* it: the run continued, but with a fraction of the work
+  the title wanted to do, so every measurement taken before this change described a much shallower boot than it appeared
+  to;
+* the remaining stop is unaffected, which makes it the more clearly isolated: after five times as many device calls the
+  title still arrives at the same null object (`game+0xCC2861`, reading `0x10`) instead of anything downstream.
+
+BCPack and swizzle requests are still refused explicitly; the log names the modes and size bands when they are asked for.
