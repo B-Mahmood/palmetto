@@ -335,6 +335,12 @@ def main(argv=None) -> int:
                 entry[k] = meta[k]
         with open(os.path.join(a.out, "fspx", name + ".code"), "wb") as f:
             f.write(code)
+        if i in cs_state:
+            # The compute state blob is the pipeline's FSPX kind-0 entry. The runtime's slot-67 lookup filters a
+            # program's candidates by the SHA-256 of that state, so it has to sit next to the code as <name>.state,
+            # the same sidecar tools/fspx_unpack.py writes for the DLL's programs.
+            with open(os.path.join(a.out, "fspx", name + ".state"), "wb") as f:
+                f.write(blob(b, lib, cs_state[i]))
         with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
             json.dump(meta, f, indent=1)
         if disasm and end:
