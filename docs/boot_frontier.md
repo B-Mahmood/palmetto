@@ -161,3 +161,23 @@ that derivation comes from `llvm-mc --show-encoding`, so nothing is guessed.
 
 Program 07 is the trial case: one word, one instruction form, and a shader that already translates in every other
 respect.
+
+## Two classes among the eleven, and what each needs
+
+Repairing the listings with `tools/widen_smem_decode.py` split the eleven refusals into two classes, which need different
+work:
+
+| class | what it is | state |
+|---|---|---|
+| register file | a buffer load whose destination is above LLVM's 106-register model, skipped and re-anchored | **fixed for the words it covers**: the tool reconstructs them from the program bytes, and program 07 now translates and passes spirv-val |
+| inline literals | an instruction LLVM decodes correctly but prints with a canonical encoding, because it drops an inline-literal or op-sel field | **open**: with the strict printed-encoding check relaxed as a measurement, the repaired set still translates 18 of 29 and the remaining failures are `branch target outside code`, so the driver is byte drift after the words the tool cannot yet rebuild |
+
+Adding program 07's module to the corpus does **not** create any pipeline: the run still reports the same 42 failing
+`DeserializeComputePipelineStateX` calls and stops in the same place. So that program is not one of the ones the title
+actually asks for, and a translation that passes `spirv-val` is not by itself progress on the boot.
+
+### What that implies for the remaining work
+
+The 42 pipelines need specific programs among the untranslated ten. Getting there means finishing class 2 - making the
+repaired listing's instruction offsets agree with the blob for the inline-literal forms - and only then re-measuring.
+A partial set is measurably useless: it changes neither the failure count nor the stop.
