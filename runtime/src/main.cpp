@@ -262,6 +262,26 @@ int wmain(int argc, wchar_t** argv) {
             std::printf("console paths: GAME: -> %s, writes -> %s\n",
                         reinterpret_cast<const char*>(game.c_str()), reinterpret_cast<const char*>(overlay.c_str()));
         }
+        // LEONIDA_RESOLVE=<hex address>: say what lives at an address a call or a store names, so a target outside the
+        // mapped modules is identified rather than guessed at. Prints the allocation's state, protection and, when it
+        // belongs to a loaded module, that module's name.
+        if (const DWORD size = GetEnvironmentVariableW(L"LEONIDA_RESOLVE", nullptr, 0); size > 1) {
+            std::wstring value(size, L'\0');
+            const DWORD n = GetEnvironmentVariableW(L"LEONIDA_RESOLVE", value.data(), size);
+            if (n > 0 && n < size) value.resize(n);
+            const auto address = std::wcstoull(value.c_str(), nullptr, 16);
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) == sizeof(info)) {
+                std::printf("[rt] resolve 0x%llx: state 0x%lx protect 0x%lx type 0x%lx allocation 0x%llx size 0x%llx\n",
+                            static_cast<unsigned long long>(address), static_cast<unsigned long>(info.State),
+                            static_cast<unsigned long>(info.Protect), static_cast<unsigned long>(info.Type),
+                            static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info.AllocationBase)),
+                            static_cast<unsigned long long>(info.RegionSize));
+            } else {
+                std::printf("[rt] resolve 0x%llx: not committed\n", static_cast<unsigned long long>(address));
+            }
+            std::fflush(stdout);
+        }
         std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);
         // LEONIDA_WATCH_GLOBAL=<hex rva> logs every change of a mapped image's 8-byte global with the millisecond it
