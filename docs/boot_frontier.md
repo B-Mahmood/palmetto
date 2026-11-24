@@ -12,7 +12,7 @@ rather than a guess. Counts, arities and error classes only; no package bytes or
 | # | Stop | Class | Measured |
 |---:|---|---|---|
 | 1 | device slot 61 forwarded to PC `CreateMetaCommand` | wrong arity | fixed: refuses with E_NOTIMPL, logs both arguments |
-| 2 | device slot 67 `DeserializeComputePipelineStateX` refused, 42 of 42 | missing translation | **live**: the 42 pipelines need FSPX programs among the 11 of 29 that do not translate yet |
+| 2 | device slot 67 `DeserializeComputePipelineStateX`, 42 calls | missing translation | **solved**: they are the title's own precompiled compute programs from the pipeline library inside `shaders.rpf`, not FidelityFX programs; 38 of the 42 translate, the corpus carries them, and 0 creations fail |
 | 3 | device slot 108 forwarded to the PC table | unknown shape | **current stop**: called with two arguments (an output pointer and a structure pointer) from 29 sites |
 
 The run reaches **2,238 D3D12 calls** and stops at the third row.
@@ -202,3 +202,27 @@ the repair tool leaves these lines alone.
 Finishing this class means teaching the translator to read the dropped field from the blob for the VOP forms involved -
 the same shape as `mix_literal`, which already exists for other families - and then re-measuring. Until that is done the
 FidelityFX pipelines cannot be created, and the run stops where it has stopped since the pipelines were first reached.
+
+## Correction: the refused pipelines are the title's own, not FidelityFX
+
+An earlier section here said the 42 refused pipelines needed FidelityFX programs among the eleven the translator cannot
+translate. That was wrong, and measuring it properly corrected the picture:
+
+* the 42 refusals carry 39 distinct program keys, and none matches any of the 29 FidelityFX programs - not by key, and
+  not by size class either;
+* they are the title's own **precompiled compute pipelines**, deserialized from the pipeline library inside
+  `shaders.rpf`, whose format is in [shader_library.md](shader_library.md). 31 of the 39 keys are byte-identical to
+  library compute programs 0..30.
+
+Extracting that library, writing the missing `<name>.state` sidecars - the runtime filters a program's candidates by the
+SHA-256 of its kind-0 state, so without them no library program can resolve - and translating its compute programs gives
+**38 of 42 translated and `spirv-val` clean**. Four are refused with `CS thread-group-size SGPR`. With those in the
+corpus and the stand-in pipeline switched off, **0 of 42 pipeline creations fail**, and the run reaches device slot 108
+and stops inside the title itself.
+
+Three consequences for anyone continuing:
+
+* `tools/shader_library.py` now writes `<name>.state`; a pipeline cannot resolve without it;
+* nothing in `make_game.py` runs the pipeline-library step yet, so a fresh build still reproduces the old failure;
+* `tools/rdna2spirv.py`'s stage fallback reads `lib_cs_*` as stage `lib`, so a library listing needs an `index.json`
+  beside it (or the fallback fixed) or it is refused as an unknown stage.
