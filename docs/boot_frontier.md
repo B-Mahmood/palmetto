@@ -137,7 +137,27 @@ The program's own metadata says it is a wave32 compute program with 64 VGPRs, 14
 destination the undecodable word names would be `s[100:107]`, past the scalar-register file that every RDNA2 target LLVM
 models allows, which is why it decodes as invalid while its neighbours decode.
 
-That leaves one question worth answering before more work: whether the console accepts a destination that LLVM's register
-model forbids (a gfx1013 difference), or the word is not that instruction at all and the opcode byte means something
-else on this part. The first would need the disassembler to accept a wider register file; the second would need the
-opcode identified. Both are reproducible from the listing and the blob with `tools/` alone.
+### The answer: the console's register file is larger than LLVM's model
+
+The programs settle it themselves. Their compute metadata declares the register counts, and decoding the granularity
+field of `rsrc1` (`0x402c0347`) gives **112 SGPRs** for a wave32 program; the same value appears in programs 07, 12 and
+18. LLVM's RDNA2 model allows **106** scalar registers at most, and it says so plainly when asked to assemble the
+instruction the word encodes:
+
+```
+s_buffer_load_dwordx8 s[100:107], s[16:19], s12 offset:0x7800   -> error: register index is out of range
+s_buffer_load_dwordx8 s[96:103],  s[16:19], s12 offset:0x7800   -> assembles, encoding 08 18 2c f4 00 78 00 18
+```
+
+So the skipped word is a valid instruction on this console whose destination register LLVM's register file does not
+contain, and the same will be true of every other reference to a register above 103 in these programs. The disassembler
+is not wrong about the encoding; it is modelling a smaller machine.
+
+**What that means for the fix.** No runtime change helps and no LLVM flag helps: the disassembler has to be told the
+console's register file is bigger, or the pipeline has to decode these words itself. The pipeline route is available
+without rebuilding LLVM: assemble the same instruction forms with destinations inside LLVM's range under each candidate
+`mcpu`, derive the bit fields, and emit the listing line for the out-of-range cases from the bytes. The ground truth for
+that derivation comes from `llvm-mc --show-encoding`, so nothing is guessed.
+
+Program 07 is the trial case: one word, one instruction form, and a shader that already translates in every other
+respect.
