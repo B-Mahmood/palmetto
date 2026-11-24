@@ -226,3 +226,26 @@ Three consequences for anyone continuing:
 * nothing in `make_game.py` runs the pipeline-library step yet, so a fresh build still reproduces the old failure;
 * `tools/rdna2spirv.py`'s stage fallback reads `lib_cs_*` as stage `lib`, so a library listing needs an `index.json`
   beside it (or the fallback fixed) or it is refused as an unknown stage.
+
+## The stop is independent of the compute pipelines
+
+With all 42 compute pipelines created - 31 from translated library programs and the other eleven standing in - the run
+still stops at the same place: `game+0xCC2861`, a read of `0x10` because the function is entered with a null object.
+
+The caller loads that object from a process global and passes it straight in:
+
+```
+5BFEBD5: mov rcx, qword ptr [rip + ...]   ; the object, null here
+5BFEC10: call 0x140CC2840                 ; test byte [rdi+0x10], 4  -> fault
+```
+
+So the missing pipelines were not the cause of this stop. The global is filled by something earlier in the boot that the
+runtime either refused or answered without an object. Candidates measured in the same run, in order:
+
+* device slots 86 and 108 are console extensions beyond the PC device table; they are stubbed with S_OK and, for 108, a
+  zero dword, which publishes no object at all;
+* `ShaderCacheControl` fails, `CreateLifetimeTracker` returns E_NOTIMPL, the texture computer path returns E_NOTIMPL
+  (it does hand back a stub object), and DirectStorage reports zlib/BCPack/swizzle requests as not implemented.
+
+The next step is to find which of those results the title stores in that global - by logging the arguments of the
+beyond-table stubs and the value each caller keeps - rather than guessing at the crash site itself.
