@@ -6,10 +6,12 @@
 //   - OpenFile resolves kernel32.dll!CreateFileW through the shim registry, so a GAME: path goes through the
 //     runtime's console path mapping and write overlay (file_system.cpp) exactly as the title's own CreateFileW.
 //   - Each queue has one worker thread that runs its submitted entries in order: a request reads a file range or
-//     copies a memory range into the destination, a status entry, fence signal or event runs when every entry before
-//     it has. Completion is therefore in queue order, as the API guarantees.
-//   - zlib, BCPack, swizzle and physical-page requests fail with E_NOTIMPL for now (later PRs: they become stages
-//     between execute_request's read and its destination write).
+//     copies a memory range into the destination (inflating a zlib request's source first), a status entry, fence
+//     signal or event runs when every entry before it has. Completion is therefore in queue order, as the API
+//     guarantees.
+//   - A request's zlib stage (the reference's ZlibDecompress, RFC 1950) runs here: its compressed source is inflated
+//     with the runtime's own inflate (src/shader_library.h) into the destination the request names. BCPack, swizzle and
+//     physical-page requests still fail with E_NOTIMPL (later PRs: they become the stages after the zlib stage).
 // Nothing here goes online or touches the GPU.
 #include <windows.h>
 #include <d3d12.h>
@@ -29,6 +31,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "../src/shader_library.h"  // leonida::zlib_inflate: the runtime's own RFC 1950/1951 inflate
 #include "dstorage_xs_abi.h"
 #include "shims.h"
 
@@ -65,6 +68,21 @@ std::string hr_text(HRESULT hr) {
     char b[16];
     std::snprintf(b, sizeof b, "0x%08lx", static_cast<unsigned long>(hr));
     return b;
+}
+
+// dstorageerr.h's decompression failure code ("a generic error has happened during decompression"; the console ABI
+// header declares the errors this file already reported, so the one the zlib stage needs stays local until that header
+// carries it).
+constexpr HRESULT kDecompressionError = static_cast<HRESULT>(0x89240030L);
+
+// Which band a request buffer's size falls in, for the one-time logs: no byte counts, no addresses, and the bands are
+// the reference's own request limits.
+const char* size_band(uint32_t bytes) {
+    if (bytes <= (64u << 10)) return "up to 64 KiB";
+    if (bytes <= (1u << 20)) return "over 64 KiB, up to 1 MiB";
+    if (bytes <= (8u << 20)) return "over 1 MiB, up to 8 MiB";
+    if (bytes <= kMax4kPageDestinationSize) return "over 8 MiB, up to 32 MiB";
+    return "over 32 MiB";
 }
 
 // ---- Interface ids ------------------------------------------------------------------------------------------------
@@ -776,14 +794,24 @@ private:
         if (options::source_type(o) != desc_.SourceType) return E_DSTORAGE_INVALID_SOURCE_TYPE;
         if (options::bcpack(o) > DSTORAGE_BCPACK_MODE_BC7) return E_DSTORAGE_INVALID_BCPACK_MODE;
         if (options::swizzle(o) > DSTORAGE_SWIZZLE_MODE_4K_12K_4K_12K) return E_DSTORAGE_INVALID_SWIZZLE_MODE;
-        if (options::zlib(o) || options::bcpack(o) != 0 || options::swizzle(o) != 0) {
-            log_once("decompress", "zlib, BCPack and swizzle requests are not implemented yet (E_NOTIMPL)");
-            return E_NOTIMPL;
-        }
         if (o & (options::kDestinationPages | options::kSourcePages)) {
             log_once("pages", "physical-page requests are not implemented yet (E_NOTIMPL)");
             return E_NOTIMPL;
         }
+        // BCPack and swizzle are still not implemented, alone or on top of zlib (the reference applies zlib, then
+        // BCPack, then swizzle). A request that names either fails whole, before any read, so no partial intermediate
+        // or unswizzled data is left in its destination.
+        if (options::bcpack(o) != 0 || options::swizzle(o) != 0) {
+            log_once("bcpack-swizzle",
+                     std::string("BCPack and swizzle requests are not implemented yet (E_NOTIMPL; command type ") +
+                         std::to_string(static_cast<int>(DSTORAGE_COMMAND_TYPE_REQUEST)) + "; BCPack mode " +
+                         std::to_string(options::bcpack(o)) + ", swizzle mode " +
+                         std::to_string(options::swizzle(o)) + ", zlib " + (options::zlib(o) ? "on" : "off") +
+                         "; source " + size_band(r.SourceSize) + ", destination " + size_band(r.DestinationSize) +
+                         ")");
+            return E_NOTIMPL;
+        }
+        if (options::zlib(o)) return decompress_zlib_request(e);
         if (r.IntermediateSize != 0) return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;  // only zlib + BCPack use it
         if (r.DestinationSize != r.SourceSize) return E_DSTORAGE_INVALID_DESTINATION_SIZE;
         const bool memory = desc_.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY;
@@ -802,6 +830,63 @@ private:
         if (r.SourceSize == 0) return S_OK;  // nothing to move; the reference does not say this fails
         if (memory) return guarded_move(r.Destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
         return read_file_range(e.file->handle(), r.FileOffset, r.Destination, r.SourceSize);
+    }
+
+    // The zlib stage of a request. The compressed source is read exactly as an uncompressed request reads its source
+    // (a file range or a memory range), the whole stream is inflated into a scratch buffer, and the destination is
+    // written only once the stream ended at exactly DestinationSize with a matching Adler-32: a failed request leaves
+    // no partial result behind. DestinationSize is the decompressed size (the reference: it must be greater than
+    // SourceSize when decompression is used) and IntermediateSize is the BCPack size, valid only with BCPack, which is
+    // refused before this point.
+    HRESULT decompress_zlib_request(const Entry& e) {
+        const DSTORAGE_REQUEST& r = e.request;
+        const bool memory = desc_.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY;
+        // One-time per failure reason: names the command type and the request's size bands, never its data or buffers.
+        const auto fail = [&r](HRESULT hr, const char* why) {
+            log_once(std::string("zlib") + hr_text(hr) + why,
+                     std::string("a zlib request failed: ") + why + " (" + hr_text(hr) + "; command type " +
+                         std::to_string(static_cast<int>(DSTORAGE_COMMAND_TYPE_REQUEST)) + "; source " +
+                         size_band(r.SourceSize) + ", destination " + size_band(r.DestinationSize) + ")");
+            return hr;
+        };
+        if (r.IntermediateSize != 0)
+            return fail(E_DSTORAGE_INVALID_INTERMEDIATE_SIZE, "an intermediate size without BCPack");
+        if (r.DestinationSize <= r.SourceSize)
+            return fail(E_DSTORAGE_INVALID_DESTINATION_SIZE, "a destination no larger than the compressed source");
+        const uint64_t total = static_cast<uint64_t>(r.DestinationSize) + (memory ? r.SourceSize : 0u);
+        if (total > kMaxRequestBytes) return fail(E_DSTORAGE_REQUEST_TOO_LARGE, "source and destination over 1 GiB");
+        // The same 32 MiB rule as for an uncompressed destination: a larger linear buffer would need 64 KiB or 2 MiB
+        // pages, which are not implemented yet.
+        if (r.DestinationSize > kMax4kPageDestinationSize)
+            return fail(E_DSTORAGE_REQUEST_TOO_LARGE, "a linear destination over 32 MiB");
+        if (!r.Destination) return fail(E_INVALIDARG, "a null destination");
+        if (memory) {
+            if (!r.Source) return fail(E_INVALIDARG, "a null source");
+        } else {
+            if (!r.File) return fail(E_INVALIDARG, "a null file");
+            if (!e.file_counted) return fail(E_DSTORAGE_FILE_NOT_OPEN, "a file that is not open");
+            // The reference: FileOffset is 16-byte aligned when decompression is used.
+            if (r.FileOffset % 16) return fail(E_DSTORAGE_INVALID_FILE_OFFSET, "a file offset not 16-byte aligned");
+        }
+        if (r.SourceSize == 0) return S_OK;  // nothing to inflate; mirrors the uncompressed path
+        std::vector<uint8_t> compressed(r.SourceSize);
+        if (memory) {
+            if (!guarded_move(compressed.data(), r.Source, r.SourceSize))
+                return fail(E_DSTORAGE_ACCESS_VIOLATION, "an inaccessible source");
+        } else if (const HRESULT hr = read_file_range(e.file->handle(), r.FileOffset, compressed.data(), r.SourceSize);
+                   FAILED(hr)) {
+            return hr;  // E_DSTORAGE_END_OF_FILE or the Win32 error, as an uncompressed request reports it
+        }
+        std::vector<uint8_t> decompressed;
+        if (!leonida::zlib_inflate(compressed, decompressed, r.DestinationSize) ||
+            decompressed.size() != static_cast<size_t>(r.DestinationSize))
+            return fail(kDecompressionError, "a malformed stream or a decompressed size that does not match");
+        if (!guarded_move(r.Destination, decompressed.data(), decompressed.size()))
+            return fail(E_DSTORAGE_ACCESS_VIOLATION, "an inaccessible destination");
+        log_once("zlib-ok", std::string("a zlib request decompressed (command type ") +
+                                std::to_string(static_cast<int>(DSTORAGE_COMMAND_TYPE_REQUEST)) + "; source " +
+                                size_band(r.SourceSize) + ", destination " + size_band(r.DestinationSize) + ")");
+        return S_OK;
     }
 
     void set_pending(int delta) {
