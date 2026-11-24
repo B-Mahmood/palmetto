@@ -4119,6 +4119,25 @@ public:
         }
         if (!entry) {
             const bool fspx = program.kind == leonida::ComputeProgram::Kind::fspx;
+            // The title's own precompiled pipelines are deserialized from its pipeline library. Eleven of the 42 it
+            // asks for carry bytes that do not match the extracted library records, so the exact program it passes is
+            // dumped here for offline translation. LEONIDA_DUMP_PIPELINES=<dir> writes <sha256>.code and .state into
+            // that dir - game data, so it must be a work folder outside any repository.
+            if (const char* dir = std::getenv("LEONIDA_DUMP_PIPELINES"); dir && *dir) {
+                const std::string stem = leonida::sha256_hex(program.bytes);
+                const std::string base = std::string(dir) + "\\" + stem;
+                if (FILE* f = std::fopen((base + ".code").c_str(), "wb")) {
+                    std::fwrite(program.bytes.data(), 1, program.bytes.size(), f);
+                    std::fclose(f);
+                }
+                if (!program.state.empty()) {
+                    if (FILE* f = std::fopen((base + ".state").c_str(), "wb")) {
+                        std::fwrite(program.state.data(), 1, program.state.size(), f);
+                        std::fclose(f);
+                    }
+                }
+                std::fprintf(stderr, "[rt] d3d12: dumped an untranslated pipeline program to %s.code\n", stem.c_str());
+            }
             if (ambiguous)
                 std::fprintf(stderr, "[rt] d3d12: FSPX kind-6 program sha256 %s is ambiguous without its kind-0 "
                                      "state: its translations differ\n", leonida::sha256_hex(program.bytes).c_str());
