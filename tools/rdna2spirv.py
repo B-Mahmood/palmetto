@@ -17154,6 +17154,98 @@ def ds_const_extent(op, key, value):
     return (start + size - 1) // 4 + 1
 
 
+# The console's VOP3P v_dot4_i32_i8 (opcode 0x16) stores op_sel/op_sel_hi/neg/clamp fields that llvm-mc 21's
+# gfx1030 model does not carry for this instruction: it decodes the operands and re-encodes the canonical
+# op_sel 0, op_sel_hi 7, no neg, no clamp. A stored word whose fields are not canonical therefore compares unequal
+# to the printed encoding, and one with op_sel bit 1 set does not decode at all. The field positions come from
+# llvm-mc itself, one bit at a time: clearing VOP3P word0 bit 12 makes a word llvm-mc rejected decode, and setting
+# word0 bits 8/9/10, word1 bits 29/30/31 or word0 bit 15 makes llvm-mc print neg_hi:[...], neg_lo:[...] or clamp.
+# docs/fspx.md measured the undecodable ones on RDNA2 hardware: they are all opcode 0x16 with op_sel 2 and
+# op_sel_hi 5, i.e. the 16-bit halves of the second source exchanged - the same op_sel/op_sel_hi semantics the
+# translator's v_dot4_i32_i8 handler implements (docs/design.md, "Signed-byte dot products").
+VOP3P_DOT4_OPCODE = 0x16
+CONSOLE_DOT4_OP_SEL = 2
+CONSOLE_DOT4_OP_SEL_HI = 5
+
+
+def vop3p_dot4_fields(w0, w1):
+    """The opcode and the op_sel/op_sel_hi/neg_lo/neg_hi/clamp fields of a gfx10 VOP3P word pair, as a dict.
+
+    LLVM's VOP3Pe encoding (lib/Target/AMDGPU/VOPInstructions.td): Inst{11-13} op_sel(0..2), Inst{14} op_sel_hi(2),
+    Inst{59-60} op_sel_hi(0..1), Inst{8-10} neg_hi, Inst{61-63} neg_lo and Inst{15} clamp."""
+    return {"opcode": (w0 >> 16) & 0xFF, "op_sel": (w0 >> 11) & 7,
+            "op_sel_hi": ((w1 >> 27) & 3) | (((w0 >> 14) & 1) << 2),
+            "neg_hi": (w0 >> 8) & 7, "neg_lo": (w1 >> 29) & 7, "clamp": (w0 >> 15) & 1}
+
+
+def vop3p_dot4_canonical(w0, w1):
+    """The two words llvm-mc re-encodes for the v_dot4_i32_i8 it decoded: op_sel 0, op_sel_hi 7, no neg, no clamp."""
+    return ((w0 & ~(7 << 11) & ~(7 << 8) & ~(1 << 15)) | (1 << 14),
+            (w1 & ~(3 << 27) & ~(7 << 29)) | (3 << 27))
+
+
+def vop3p_dot4_mods(f):
+    """The listing modifiers a v_dot4_i32_i8's stored fields mean. Canonical fields add none, so a translation that
+    prints its instructions before this fix reads the same operands; a set neg or clamp bit is added so the
+    translator refuses it (neg_lo/neg_hi) or applies it (clamp) instead of dropping it."""
+    mods = []
+    if f["op_sel"]:
+        mods.append("op_sel:[%s]" % ",".join(str((f["op_sel"] >> i) & 1) for i in range(3)))
+    if f["op_sel_hi"] != 7:
+        mods.append("op_sel_hi:[%s]" % ",".join(str((f["op_sel_hi"] >> i) & 1) for i in range(3)))
+    for name in ("neg_hi", "neg_lo"):
+        if f[name]:
+            mods.append("%s:[%s]" % (name, ",".join(str((f[name] >> i) & 1) for i in range(3))))
+    if f["clamp"]:
+        mods.append("clamp")
+    return mods
+
+
+def restore_vop3p_dot4(ins, raw, enc):
+    """Read the v_dot4_i32_i8 fields llvm-mc's model drops from the stored bytes; True if ``raw`` is that form.
+
+    ``raw`` is the 8 bytes at the instruction's offset and ``enc`` the 8 bytes llvm-mc printed. Accepted only when
+    the stored word, with those fields put back to what llvm-mc would re-encode, is exactly ``enc``: every other bit
+    - the opcode, both source tuples, the destination - must match, so no operand is taken from a guess."""
+    if base_op(ins["op"]) != "v_dot4_i32_i8" or len(raw) != 8 or len(enc) != 8 or raw[3] != 0xCC:
+        return False
+    w0 = int.from_bytes(raw[:4], "little")
+    w1 = int.from_bytes(raw[4:], "little")
+    f = vop3p_dot4_fields(w0, w1)
+    p0, p1 = vop3p_dot4_canonical(w0, w1)
+    if f["opcode"] != VOP3P_DOT4_OPCODE or p0.to_bytes(4, "little") + p1.to_bytes(4, "little") != enc:
+        return False
+    ins["mods"] = ins["mods"] + vop3p_dot4_mods(f)
+    ins["enc"] = raw.hex()
+    return True
+
+
+def console_dot4_word(blob, pc):
+    """The console's VOP3P v_dot4_i32_i8 at blob[pc:pc+8] as an instruction, or None.
+
+    docs/fspx.md measured this form on RDNA2 hardware: opcode 0x16 with op_sel 2 and op_sel_hi 5, the undecodable
+    words of the FSPX programs. It is decoded by the repository's own RDNA2 decoder (tools/rdna2_decode.py), and
+    only that measured form is accepted: any other op_sel/op_sel_hi, neg or clamp value returns None."""
+    import rdna2_decode     # on demand: a game-corpus run never reaches this path
+    raw = blob[pc:pc + 8]
+    if len(raw) != 8 or raw[3] != 0xCC:
+        return None
+    w0 = int.from_bytes(raw[:4], "little")
+    w1 = int.from_bytes(raw[4:], "little")
+    f = vop3p_dot4_fields(w0, w1)
+    if (f["opcode"] != VOP3P_DOT4_OPCODE or f["op_sel"] != CONSOLE_DOT4_OP_SEL or
+            f["op_sel_hi"] != CONSOLE_DOT4_OP_SEL_HI or f["neg_hi"] or f["neg_lo"] or f["clamp"]):
+        return None
+    d = rdna2_decode.decode_bytes(raw, mcpu="gfx1030", code_start=pc)
+    if d["invalid"] or len(d["insns"]) != 1:
+        return None
+    ins = d["insns"][0]
+    if base_op(ins["op"]) != "v_dot4_i32_i8" or len(ins["args"]) != 4 or len(ins["enc"]) != 16:
+        return None
+    ins["mods"] = vop3p_dot4_mods(f)          # the measured form's fields, not the decoder's formatting
+    return ins
+
+
 def check_printed_encodings(path, info):
     """A listing without undecodable words is translated from LLVM's text, which shows the instruction LLVM decoded,
     not the bytes it read. Where those bytes sit next to the listing (fssm/ or fspx/), each instruction's printed
@@ -17162,7 +17254,12 @@ def check_printed_encodings(path, info):
     and re-encodes them as 0. On the 1.0.2.1 corpus all 30,335,381 instructions of the 25,030 such listings match.
     Only a listing whose header names the code range it was disassembled from (shader_disasm.py), with a blob that
     holds that range, is checked: a hand-written listing, run_gpu_tests.py's "code 0x0..0x0 (synthetic)" and a
-    test's header-only blob are not the bytes the text came from."""
+    test's header-only blob are not the bytes the text came from.
+
+    The FSPX programs are the one case where the printed encoding is not the stored instruction and the text does
+    not lose information: their v_dot4_i32_i8 carries op_sel fields llvm-mc's model does not print (restored here
+    from the stored bytes, see restore_vop3p_dot4) and the words llvm-mc rejected are decoded from the program
+    bytes (console_dot4_word). Both are refused unless every other bit matches what the listing says."""
     with open(path, encoding="utf-8", errors="replace") as f:
         m = HDR.match(f.readline())
     if not m or int(m.group(3), 16) <= int(m.group(2), 16):
@@ -17174,25 +17271,59 @@ def check_printed_encodings(path, info):
     if int(m.group(3), 16) > len(blob):
         return
     shift = 0        # bytes the decoder read past the printed encodings so far (mix_inline_literal)
-    for ins in info["insns"]:
+    insns, out = info["insns"], []
+    i = 0
+    while i < len(insns):
+        ins = insns[i]
         ins["pc"] += shift
-        if not ins.get("enc"):
+        enc = bytes.fromhex(ins["enc"]) if ins.get("enc") else b""
+        if not enc:
+            out.append(ins)
+            i += 1
             continue
-        enc = bytes.fromhex(ins["enc"])
         raw = blob[ins["pc"]:ins["pc"] + len(enc)]
-        if not same_encoding(raw, enc, ins["op"], len(ins["args"])):
-            literal = mix_literal(raw, enc, base_op(ins["op"]))
-            if literal is not None:
-                restore_mix_literal(ins, raw, literal)
+        if same_encoding(raw, enc, ins["op"], len(ins["args"])):
+            out.append(ins)
+            i += 1
+            continue
+        literal = mix_literal(raw, enc, base_op(ins["op"]))
+        if literal is not None:
+            restore_mix_literal(ins, raw, literal)
+            out.append(ins)
+            i += 1
+            continue
+        raw12 = blob[ins["pc"]:ins["pc"] + 12]
+        literal = mix_inline_literal(raw12, enc, base_op(ins["op"]))
+        if literal is not None:
+            restore_mix_inline_literal(ins, raw12, literal)
+            shift += 4
+            out.append(ins)
+            i += 1
+            continue
+        if restore_vop3p_dot4(ins, raw, enc):
+            out.append(ins)
+            i += 1
+            continue
+        if len(enc) == 4 and len(raw) == 4:
+            # llvm-mc could not decode the word at this offset and decoded the instruction's second word as a
+            # separate 4-byte instruction: that line is the one here. Rebuild the whole word from the blob.
+            word = console_dot4_word(blob, ins["pc"])
+            if word is not None and same_encoding(blob[ins["pc"] + 4:ins["pc"] + 8], enc,
+                                                  ins["op"], len(ins["args"])):
+                out.append(word)
+                shift += 4          # the reconstructed instruction is 8 bytes; the line said 4
+                i += 1
                 continue
-            raw12 = blob[ins["pc"]:ins["pc"] + 12]
-            literal = mix_inline_literal(raw12, enc, base_op(ins["op"]))
-            if literal is not None:
-                restore_mix_inline_literal(ins, raw12, literal)
-                shift += 4
-                continue
-            raise Unsupported(f"{ins['op']} at 0x{ins['pc']:x}: the blob holds {raw.hex()}, LLVM printed "
-                              f"{enc.hex()} (a field the disassembler dropped)")
+        drift = next((d for d in range(4, 129, 4)
+                      if blob[ins["pc"] + d:ins["pc"] + d + len(enc)] == enc), 0)
+        if drift:
+            # Report the boundary, not a dropped field: the words between are ones llvm-mc could not decode.
+            raise Unsupported(f"{ins['op']} at 0x{ins['pc']:x}: the listing and the blob disagree about the "
+                              f"instruction boundary (the printed encoding is the blob's bytes at "
+                              f"+0x{drift:x}; the words in between are undecodable, not a dropped field)")
+        raise Unsupported(f"{ins['op']} at 0x{ins['pc']:x}: the blob holds {raw.hex()}, LLVM printed "
+                          f"{enc.hex()} (a field the disassembler dropped)")
+    info["insns"][:] = out
 
 
 def cs_dispatch_state(path, name):
@@ -17252,6 +17383,8 @@ def translate(path):
                     restore_mix_inline_literal(ins, blob[at:at + 12], literal)
                     enc = blob[at:at + 12]          # the 12 bytes the decoder read: the next one starts after them
                     break
+                if restore_vop3p_dot4(ins, blob[at:at + len(enc)], enc):
+                    break
                 at += 4
                 skipped += 4
                 if skipped > 4096 or at >= len(blob):
@@ -17268,6 +17401,22 @@ def translate(path):
                 ins["normalized"] = True
             ins["pc"] = at
             pos = at + len(enc)
+        # The console's v_dot4_i32_i8 words llvm-mc could not decode are in the listing as the instruction it
+        # decoded instead: re-anchoring put the line for the word's second half at +4 from the skipped word.
+        # Rebuild the whole word from the blob and drop that line (docs/fspx.md measured the shape). A skipped
+        # word of any other kind is left alone, so reachable_code still refuses a path that falls into it.
+        kept, prev_end = [], info["code_start"]
+        for ins in insns:
+            if ins["pc"] - prev_end == 4:
+                word = console_dot4_word(blob, prev_end)
+                if word is not None and same_encoding(blob[prev_end + 4:prev_end + 8],
+                                                      bytes.fromhex(ins["enc"]), ins["op"], len(ins["args"])):
+                    kept.append(word)
+                    prev_end += 8
+                    continue
+            kept.append(ins)
+            prev_end = ins["pc"] + len(ins["enc"]) // 2
+        insns = kept
         insns = fold_far_branches(insns)
         insns = reachable_code(insns, info.get("code_end"))
         if any(i.get("normalized") for i in insns):
