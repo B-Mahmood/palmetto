@@ -107,3 +107,31 @@ such word, which makes it the cheapest place to find that first divergence.
 Either way the work is in the translator and its disassembly, not in the D3D12 layer: the runtime cannot create these
 compute pipelines until the programs translate, and the title stops on a null pipeline when they do not. That is the only
 thing between the runtime and a first frame, and it is a translator project rather than a wiring change.
+
+### The fall-through site in program 07
+
+The translator re-anchors every instruction to its true offset in the program blob when a listing contains undecodable
+words, then translates only what is reachable from the entry. Doing that for program 07 puts the skipped word in a
+precise place:
+
+```
+re-anchoring skipped 1 range: 0x4F08..0x4F0C (4 bytes)
+
+0x4EF4  s_clause
+0x4EF8  s_buffer_load_dwordx8
+0x4F00  s_buffer_load_dwordx8      <- ends at 0x4F08
+0x4F08  (skipped word)             <- the path falls in here
+0x4F0C  28 2c 14 1a                <- code resumes here
+```
+
+Nothing branches to 0x4F08, so the path arrives by fall-through from the scalar load at 0x4F00. Two facts make that
+suspicious rather than decisive:
+
+* the two loads before it carry `s_clause`, whose whole purpose is to bundle consecutive scalar loads, arguing that the
+  stream is genuinely a run of loads;
+* the listing's own next instruction after that region is a load encoding (`0x0817…0038`) whose bytes do not appear at
+  that offset in the blob, so the listing and the blob already disagree about this neighbourhood.
+
+The next step is to settle that disagreement - which of the two byte sequences the console actually executes, and why the
+disassembler's re-anchor chose the one it did - because the answer decides whether the fix is in decoding or in the
+control-flow walk. Everything above is reproducible from the listing and the blob with `tools/` alone.
