@@ -84,14 +84,26 @@ s_buffer_load_dwordx8 s[25:32], s[16:19], s92 offset:0x7800   -> error: invalid 
 s_buffer_load_dwordx8 s[92:99], s[16:19], s92 offset:0x7800   -> assembles, and matches an earlier instruction in the same program
 ```
 
-So the destination register the encoding names is one the assembler considers misaligned, while neighbouring instructions
-with a destination of 92 are accepted. Two readings remain, and they need different work:
+Sweeping that field settles which reading is right. The byte selects the destination, and every value the disassembler
+accepts lands inside the register file while the rejected ones do not:
 
-* the encoding is valid on the console and LLVM's constraint is stricter than the hardware, in which case the
-  disassembler needs a relaxation; or
-* the words are not an instruction at all, and the control-flow walk is wrong to reach them, in which case the fix is in
-  the CFG walk rather than in decoding.
+| value | destination | result |
+|---|---|---|
+| 0x17 | `s[92:99]` | decodes |
+| 0x18 | `s[96:103]` | decodes |
+| **0x19** | `s[100:107]` | **invalid** |
+| **0x1A** | `s[104:111]` | **invalid** |
+| 0x1B..0x1D | `ttmp[0:15]` | decodes |
 
-Either way the fix is in the translator and its disassembly, not in the D3D12 layer: the runtime cannot create these
+The rejected values name registers past the scalar-register file on every RDNA2 target LLVM models (gfx1010, gfx1011,
+gfx1012, gfx1013, gfx1030 all refuse them), so these words are **not an instruction on any of those targets**. The
+disassembler is right to reject them; the control-flow walk is wrong to reach them.
+
+That points at the walk rather than at the decoder, and specifically at where the stream first drifts: a word the title
+executes cannot sit there as data, so an earlier instruction must have been decoded at the wrong length or as the wrong
+operation, leaving the walk falling through into what is actually a literal or padding word. Program 07 has exactly one
+such word, which makes it the cheapest place to find that first divergence.
+
+Either way the work is in the translator and its disassembly, not in the D3D12 layer: the runtime cannot create these
 compute pipelines until the programs translate, and the title stops on a null pipeline when they do not. That is the only
 thing between the runtime and a first frame, and it is a translator project rather than a wiring change.
