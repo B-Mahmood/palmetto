@@ -16351,7 +16351,17 @@ def stage_of(name, path):
             with open(idx, encoding="utf-8") as f:
                 for e in json.load(f):
                     _STAGES[e["file"][:-5]] = e["stage"]
-    return _STAGES.get(name) or (name[:2].lower() if name[2:3] == "_" else "?")
+    if name in _STAGES:
+        return _STAGES[name]
+    # No index row (a shard re-run writes beside no index): the stage is in the name, but not always at offset 2.
+    # Shader names can begin with a prefix that is not part of the stage, e.g. "3reflect_inst_CS_...",
+    # "5PS_MirrorReflection...", ",smh_sim_0_CS_...", so look for a stage token anywhere rather than at name[:2].
+    match = re.search(r'(?:^|[_,\-0-9])(vs|ps|cs|gs|ms|hs|ds|as|lib)_', name, re.IGNORECASE)
+    if match:
+        return match.group(1).lower()
+    if name[2:3] == "_":
+        return name[:2].lower()
+    return "?"
 
 
 # Wave64 markers in the instruction text. Besides EXEC/VCC forms, 64-bit lane-mask SOP1/SOP2 ops
