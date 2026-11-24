@@ -1711,6 +1711,16 @@ inline void* console_heap_back(std::uint64_t address, SIZE_T size) {
 
     const SIZE_T page = static_cast<SIZE_T>(kConsoleHeapPage);
     for (SIZE_T done = 0; done < size; done += page) {
+        // A page that is already committed and writable needs no mapping: the title's range can overlap memory this
+        // process already owns (another console heap, or a section the loader mapped), and replacing it there would
+        // fail and be reported as "not backed" even though writes would have landed.
+        MEMORY_BASIC_INFORMATION info{};
+        if (::VirtualQuery(reinterpret_cast<void*>(static_cast<std::uintptr_t>(address + done)), &info,
+                           sizeof(info)) == sizeof(info)) {
+            const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+            if (info.State == MEM_COMMIT && (info.Protect & writable) && !(info.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+                continue;
+        }
         const HANDLE section = ::CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
                                                     static_cast<DWORD>(page), nullptr);
         if (!section) return nullptr;
@@ -1724,6 +1734,25 @@ inline void* console_heap_back(std::uint64_t address, SIZE_T size) {
         }
     }
     return reinterpret_cast<void*>(static_cast<std::uintptr_t>(address));
+}
+
+// One line describing what the address range is, so a backing failure names its cause instead of only its effect.
+inline void console_heap_report(std::uint64_t address, SIZE_T size) {
+    MEMORY_BASIC_INFORMATION info{};
+    const SIZE_T got = ::VirtualQuery(reinterpret_cast<void*>(static_cast<std::uintptr_t>(address)), &info, sizeof(info));
+    if (got != sizeof(info)) {
+        std::fprintf(stderr, "[rt] d3d12: console heap at 0x%llx: VirtualQuery failed (error %lu)\n",
+                     static_cast<unsigned long long>(address), GetLastError());
+        return;
+    }
+    std::fprintf(stderr,
+                 "[rt] d3d12: console heap at 0x%llx, %llu bytes: state 0x%lx, protect 0x%lx, type 0x%lx, "
+                 "region 0x%llx+0x%llx\n",
+                 static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
+                 static_cast<unsigned long>(info.State), static_cast<unsigned long>(info.Protect),
+                 static_cast<unsigned long>(info.Type),
+                 static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info.BaseAddress)),
+                 static_cast<unsigned long long>(info.RegionSize));
 }
 
 class DescriptorHeap final
@@ -1741,8 +1770,17 @@ public:
     DescriptorHeap(DeviceState& device, const D3D12_DESCRIPTOR_HEAP_DESC& desc, std::uint64_t console_address = 0,
                    std::uint64_t console_size = 0)
         : device_(device), desc_(desc), console_address_(console_address), console_size_(console_size),
-          console_addressed_(console_address != 0) {
+          // A console heap address is a 64 KiB-aligned title VA. Anything else is a field that happens to sit where
+          // the address would be - the retail boot hands 0x20 for one heap, which is no address at all - and treating
+          // it as one takes the heap out of the arena and then fails to back it.
+          console_addressed_(console_address != 0 && (console_address % kConsoleHeapPage) == 0 &&
+                             console_address >= kConsoleHeapPage) {
         const VkDeviceSize bytes = VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize;
+        if (!console_addressed_ && console_address != 0) {
+            log_once("descriptor heap carries a value that is not a console address (not 64 KiB aligned); "
+                     "using the arena, low word",
+                     static_cast<int>(console_address & 0xffffu));
+        }
         if (console_addressed_) {
             // The retail boot checks GetCPUDescriptorHandleForHeapStart() == address and then writes descriptors
             // through that handle, so the title's range has to be real memory at that address. Map exactly the
@@ -1754,6 +1792,8 @@ public:
             log_once(backing ? "descriptor heap uses console address, backed in place"
                              : "descriptor heap uses console address, NOT backed (writes will fault)",
                      int(desc_.Type));
+            if (!backing)
+                console_heap_report(console_address_, want);
             cpu_ = reinterpret_cast<std::uint8_t*>(backing ? backing
                                                           : reinterpret_cast<void*>(static_cast<std::uintptr_t>(
                                                                 console_address_)));
