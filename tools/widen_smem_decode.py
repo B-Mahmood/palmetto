@@ -1,15 +1,19 @@
-"""Repair a listing the disassembler refused because the console's SGPR file is wider than its model.
+"""Reconstruct the buffer loads a disassembler refused because the console's SGPR file is wider than its model.
 
 The retail title's compute programs declare 112 scalar registers (rsrc1 granularity field, wave32), while LLVM's RDNA2
 model allows 106. A scalar-memory instruction whose destination lies above that file is rejected: the disassembler skips
 its first four bytes, re-anchors four bytes later, and decodes the instruction's second half as an unrelated VOP. The
-translator then sees a reachable instruction running into skipped bytes and refuses the whole shader.
+translator then refuses the shader because a reachable instruction runs into the skipped bytes.
 
-This tool rebuilds those lines from the program bytes. It walks the listing against the blob, finds every place where the
-emitted encoding is not what sits there, and tries the buffer-load forms whose field layout it derives from
-`llvm-mc --show-encoding` on in-range operands. A form that matches is written with its real destination, and listing
-lines whose bytes overlap the reconstructed instruction are dropped. A reconstruction is accepted only when every
-register it names is inside the declared file, so nothing is guessed.
+This tool edits the listing in place and only where it is certain:
+
+* it walks the listing against the program bytes;
+* where the emitted encoding is not what sits at that offset, it tries the buffer-load forms whose field layout it
+  derives from `llvm-mc --show-encoding` on in-range operands;
+* a match is written with its real destination, and the listing lines whose bytes overlap the reconstructed instruction
+  are dropped;
+* anywhere else the line is copied through untouched, in its original order. The tool never re-anchors, re-orders or
+  guesses: an offset it does not understand is the translator's problem, not something to paper over.
 
 Usage:
     python -I tools/widen_smem_decode.py <listing.s> --blob <program.code|.fssm> [--out <repaired.s>]
@@ -45,7 +49,6 @@ def assemble(text, mcpu):
 
 
 def table(mcpu):
-    """(byte2, byte3) -> (form name, lanes), derived from assembling each form with in-range operands."""
     found = {}
     for name, (syntax, lanes) in FORMS.items():
         raw = assemble(syntax.format(dst=sgpr(8, lanes)) + ", s[16:19], s12 offset:0x7800", mcpu)
@@ -70,8 +73,8 @@ def decode(word, lookup, max_sgprs):
 
 def build(name, lanes, dst, sbase, soffset, offset, word):
     soff = "off" if word[7] & 0x80 else "s%d" % soffset
-    text = FORMS[name][0].format(dst=sgpr(dst, lanes))
-    line = "%s, s[%d:%d], %s offset:0x%x" % (text, sbase, sbase + 3, soff, offset)
+    line = "%s, s[%d:%d], %s offset:0x%x" % (FORMS[name][0].format(dst=sgpr(dst, lanes)), sbase, sbase + 3, soff,
+                                             offset)
     enc = ", ".join("0x%02x" % b for b in word[:8])
     return "\t%-46s ; encoding: [%s]" % (line, enc)
 
@@ -94,39 +97,34 @@ def main():
     lookup = table(args.mcpu)
     print("%d buffer-load form(s) identified at %s" % (len(lookup), args.mcpu))
 
-    pending = []
-    for line in text[1:]:
-        e = LINE.match(line)
-        if e:
-            pending.append((line, bytes(int(x, 16) for x in e.group(2).split(","))))
+    body = [(line, bytes(int(x, 16) for x in mm.group(2).split(",")))
+            for line, mm in ((ln, LINE.match(ln)) for ln in text[1:]) if mm]
 
     out, pos, repaired = [text[0]], start, 0
-    while pending:
-        line, data = pending[0]
+    i = 0
+    while i < len(body):
+        line, data = body[i]
         if blob[pos:pos + len(data)] == data:
             out.append(line)
-            pending.pop(0)
             pos += len(data)
+            i += 1
             continue
         d = decode(blob[pos:pos + 8], lookup, args.max_sgprs)
         if d:
             out.append(build(*d, blob[pos:pos + 8]))
             repaired += 1
             end = pos + 8
-            while pending:
-                at = blob.find(pending[0][1], pos, end + 4)
+            i += 1
+            while i < len(body):
+                at = blob.find(body[i][1], pos, end + 4)
                 if at == -1 or at >= end:
                     break
-                pending.pop(0)
+                i += 1
             pos = end
             continue
-        at = blob.find(data, pos, min(pos + 64, len(blob)))
-        if at < 0:
-            pending.pop(0)
-            continue
-        out.append(line)
-        pending.pop(0)
-        pos = at + len(data)
+        out.append(line)      # not understood here: copy through untouched, keep the listing's own order
+        pos += len(data)
+        i += 1
 
     target = args.out or args.listing
     with open(target, "w", encoding="utf-8", newline="\n") as f:
