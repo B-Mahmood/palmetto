@@ -43,19 +43,7 @@ extern "C" void leonida_register_console_heap(void* fn) {
     rt::d3d12::console_heap_slot() = reinterpret_cast<rt::d3d12::CreateConsoleHeapFn>(fn);
 }
 
-// Backs a page of the title's address space in place, so a write to a console VA the title chose lands in real
-// memory. Registered by the same file that owns the mapping helper; null in builds without it.
-namespace {
-using BackRangeFn = void*(WINAPI*)(std::uint64_t, std::size_t);
-BackRangeFn& back_range_slot() {
-    static BackRangeFn fn = nullptr;
-    return fn;
-}
-}  // namespace
 
-extern "C" void leonida_register_console_back(void* fn) {
-    back_range_slot() = reinterpret_cast<BackRangeFn>(fn);
-}
 
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
@@ -1942,17 +1930,12 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return 0;
     } else if constexpr (Slot == 70) {
         note_slot(70);
-        // The title hands its own console address as the output pointer for the placed resource. That range is not
-        // backed in this process, so the layer's write faults. Back the page it lands in, then forward unchanged:
-        // the call shape itself is ordinary (probed: self is the proxy, a1 is not).
-        if (trace_enabled())
-            std::fprintf(stderr, "[rt] d3d12_xs: slot 70 out=0x%llx back_fn=%d\n",
-                         static_cast<unsigned long long>(a7), back_range_slot() ? 1 : 0);
+        // The console's placed-resource call names its heap by address, and the other arguments do not follow the PC
+        // shape either (a probe shows a pointer where the description belongs and an address inside the title's own
+        // image where the output belongs). Do not guess and do not back anything: an address that falls inside the
+        // mapped image cannot be given pagefile memory without overwriting the title's code. Forward as before and
+        // let the layer answer.
         if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
-        if (a7 && back_range_slot()) {
-            constexpr std::uint64_t page = 0x10000;
-            back_range_slot()(static_cast<std::uint64_t>(a7) & ~(page - 1), page);
-        }
         using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
                                                  std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
                                                  std::uint64_t);
@@ -2148,6 +2131,9 @@ unsigned device_proxy_slot_count(const void* device) {
 void set_placed_at_va_handler(PlacedAtVaHandler handler) {
     g_placed_at_va.store(handler, std::memory_order_release);
 }
+
+PlacedAtVaHandler placed_at_va_handler() { return g_placed_at_va.load(); }
+PlacedAtVaPagesHook placed_at_va_pages_hook() { return g_placed_at_va_pages.load(); }
 
 void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook) {
     g_placed_at_va_pages.store(hook, std::memory_order_release);

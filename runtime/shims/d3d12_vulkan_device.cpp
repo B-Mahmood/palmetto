@@ -51,6 +51,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <unordered_set>
 #include <set>
 #include <string>
 #include <type_traits>
@@ -2820,6 +2821,22 @@ bool equal_semantic(const std::string& a, const char* b) {
 // A heap (section 3.3): a range of the GPU address arena, as large as the game asked for, so a placed buffer can
 // name any 64 KiB-aligned offset in it. Textures placed in it still get their own VkDeviceMemory; the offset is only
 // their key, which keeps optimal-tiling images out of the arena's memory type.
+// Live Heap objects. A console call names a heap by an address rather than with an ID3D12Heap*, and
+// Object<Heap>::from dereferences whatever it is given, so membership is checked before any tag read. Entries are
+// removed when the object dies, so a recycled address is not mistaken for a live heap.
+inline std::mutex& heap_registry_mutex() {
+    static std::mutex m;
+    return m;
+}
+inline std::unordered_set<const void*>& heap_registry_set() {
+    static std::unordered_set<const void*> set;
+    return set;
+}
+inline bool is_our_heap(const void* p) {
+    std::lock_guard lock(heap_registry_mutex());
+    return heap_registry_set().count(p) != 0;
+}
+
 class Heap final
     : public Child<Heap, ID3D12HeapStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Heap> {
 public:
@@ -2827,6 +2844,7 @@ public:
     static constexpr GUID kTag{0x5d20c7a4, 0x8e13, 0x4b6d, {0x9f, 0x27, 0x3a, 0x1c, 0x94, 0xe0, 0xb7, 0xd8}};
 
     Heap(DeviceState& device, const D3D12_HEAP_DESC& desc) : device_(device), desc_(desc) {
+        { std::lock_guard lock(heap_registry_mutex()); heap_registry_set().insert(this); }
         VkDeviceSize offset = 0;
         if (device_.arena.mapped &&
             device_.arena_allocate(desc_.SizeInBytes, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, offset,
@@ -2839,6 +2857,11 @@ public:
                     delete allocation;
                 });
         }
+    }
+
+    ~Heap() override {
+        std::lock_guard lock(heap_registry_mutex());
+        heap_registry_set().erase(this);
     }
 
     // An existing heap (OpenExistingHeapFromAddress): `memory` is the caller's committed range imported with
@@ -7304,6 +7327,17 @@ public:
                           const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear,
                           UINT32 castable_count, const DXGI_FORMAT* castable, REFIID riid, void** out) {
         if (out) *out = nullptr;
+        if (!is_our_heap(heap_interface)) {
+            // The console names a heap by an address; reading a tag from that address is what crashed the retail
+            // boot (docs/boot_audit.md B1). Refuse cleanly and name the value once.
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed))
+                std::fprintf(stderr,
+                             "[rt] d3d12: placed resource with a heap that is not a runtime heap (console address?); "
+                             "the heap identifier is %llu-bit, low word 0x%08x\n",
+                             64, static_cast<unsigned>(reinterpret_cast<std::uintptr_t>(heap_interface) & 0xffffffffu));
+            return d3d12_trace::result(method, E_INVALIDARG);
+        }
         auto* heap = Heap::from<Heap>(heap_interface);
         if (!heap || !desc) return d3d12_trace::result(method, E_INVALIDARG);
         if (heap->host_address()) {
@@ -10051,7 +10085,6 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
 }
 
 extern "C" void leonida_register_console_heap(void* fn);
-extern "C" void leonida_register_console_back(void* fn);
 
 // Hand the console descriptor-heap entry point to the device proxy (runtime/shims/d3d12_xs_device.cpp). It cannot
 // look the symbol up by name because nothing exports it from gta6rt.exe.
@@ -10060,7 +10093,6 @@ namespace {
 struct ConsoleHeapRegistration {
     ConsoleHeapRegistration() {
         leonida_register_console_heap(reinterpret_cast<void*>(&create_console_descriptor_heap));
-        leonida_register_console_back(reinterpret_cast<void*>(&console_heap_back));
     }
 } g_console_heap_registration;
 }  // namespace
