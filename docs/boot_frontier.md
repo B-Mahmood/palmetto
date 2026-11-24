@@ -70,5 +70,28 @@ refuses every one of them as `invalid instruction encoding` for `gfx1030`, `gfx1
 which points at an alignment problem in the listing rather than a missing opcode family: one mis-sized instruction
 earlier in the stream would leave exactly this kind of short, repeated remnant.
 
-That is the next thing to fix, and it is the only thing standing between the runtime and the compute pipelines the title
-requires before it draws.
+### What the skipped words actually are
+
+Program 07's single gap is the clearest case, and it settles the shape of the problem. The four bytes at the gap are the
+**first half of an eight-byte instruction**; LLVM rejects them on their own and then re-anchors four bytes later, so the
+second half is decoded as a different, unrelated instruction (`v_mul_hi_u32_u24_e32`). The translator then finds a
+reachable instruction that runs into the skipped first half and refuses the whole shader.
+
+The eight bytes together are still rejected, and the reason is a register-alignment rule rather than a missing opcode:
+
+```
+s_buffer_load_dwordx8 s[25:32], s[16:19], s92 offset:0x7800   -> error: invalid register alignment
+s_buffer_load_dwordx8 s[92:99], s[16:19], s92 offset:0x7800   -> assembles, and matches an earlier instruction in the same program
+```
+
+So the destination register the encoding names is one the assembler considers misaligned, while neighbouring instructions
+with a destination of 92 are accepted. Two readings remain, and they need different work:
+
+* the encoding is valid on the console and LLVM's constraint is stricter than the hardware, in which case the
+  disassembler needs a relaxation; or
+* the words are not an instruction at all, and the control-flow walk is wrong to reach them, in which case the fix is in
+  the CFG walk rather than in decoding.
+
+Either way the fix is in the translator and its disassembly, not in the D3D12 layer: the runtime cannot create these
+compute pipelines until the programs translate, and the title stops on a null pipeline when they do not. That is the only
+thing between the runtime and a first frame, and it is a translator project rather than a wiring change.
