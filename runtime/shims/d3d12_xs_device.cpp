@@ -2006,7 +2006,14 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
             std::fprintf(stderr, "[rt] d3d12_xs: device slot %u publishes 0 to its first argument (console extension)\n",
                          Slot);
-        if (a1 && readable_range(reinterpret_cast<const void*>(a1), sizeof(std::uint32_t)))
+        // Only publish into a caller stack slot. One of the measured call sites passes the address of a dword on its
+        // own frame; another passes an object field, and writing zero there would zero the low half of a pointer (the
+        // run then called through the corrupted value). A stack address is within a few megabytes of this frame.
+        const auto here = reinterpret_cast<std::uintptr_t>(&a1);
+        const auto target = static_cast<std::uintptr_t>(a1);
+        const auto distance = target > here ? target - here : here - target;
+        if (a1 && distance < (16u << 20) &&
+            readable_range(reinterpret_cast<const void*>(a1), sizeof(std::uint32_t)))
             *reinterpret_cast<std::uint32_t*>(a1) = 0;
         return hr_to_u64(S_OK);
     } else if constexpr (Slot == 76) {
