@@ -1995,6 +1995,20 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                          static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
                          static_cast<unsigned long long>(a3));
         return hr_to_u64(E_NOTIMPL);
+    } else if constexpr (Slot == 108 || Slot == 109) {
+        // Measured from the title's call site: both slots are called as (out, object) with the first argument pointing
+        // at a stack dword that the caller reads afterwards, and the second unchanged across the pair. They are console
+        // extensions past the PC device table, so there is no PC method to forward to. Answer success and publish zero,
+        // which is what the callers' `test eax, eax` expects from a getter with nothing to report. Logged, and only
+        // where a caller-supplied dword is actually writable.
+        note_slot(Slot);
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+            std::fprintf(stderr, "[rt] d3d12_xs: device slot %u publishes 0 to its first argument (console extension)\n",
+                         Slot);
+        if (a1 && readable_range(reinterpret_cast<const void*>(a1), sizeof(std::uint32_t)))
+            *reinterpret_cast<std::uint32_t*>(a1) = 0;
+        return hr_to_u64(S_OK);
     } else if constexpr (Slot == 76) {
         return hr_to_u64(proxy_create_resource(
             self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1),

@@ -1697,6 +1697,16 @@ struct ConsoleDescriptorHeapDesc {
 // 64 KiB, the console's page size and the granularity the title's own placeholders use.
 constexpr std::uint64_t kConsoleHeapPage = 0x10000;
 
+// Opt-in stand-in for a compute pipeline whose program has no translation (LEONIDA_STANDIN_PIPELINES=1). Diagnostic
+// only: it lets the boot continue past a missing module so the next stop can be measured, and it says so in the log.
+inline bool standin_pipelines() {
+    static const bool on = [] {
+        const char* value = std::getenv("LEONIDA_STANDIN_PIPELINES");
+        return value && *value && *value != '0';
+    }();
+    return on;
+}
+
 // Map a pagefile-backed section over [address, address+size) at that exact address, one 64 KiB page at a time.
 // Returns the address when every page was mapped, null otherwise.
 inline void* console_heap_back(std::uint64_t address, SIZE_T size) {
@@ -4087,6 +4097,7 @@ public:
             return E_INVALIDARG;
         }
         const leonida::ShaderLibrary* library = device_.library();
+        static const leonida::ShaderEntry* last_compute_entry = nullptr;
         if (!library) return E_FAIL;
         // A binding-free entry wins over one with bindings for the same program (pick_entry).
         // An FSPX program from a container is matched on its kind-0 state too; a bare kind-6 program whose
@@ -4094,6 +4105,18 @@ public:
         bool ambiguous = false;
         const leonida::ShaderEntry* entry = pick_entry(library->program_candidates("cs", program, &ambiguous),
                                                        [](const leonida::ShaderEntry&) { return true; });
+        if (!entry && last_compute_entry && standin_pipelines()) {
+            // A stand-in, as #6915 uses for a placed buffer: the title gets a pipeline object it can hold, built from
+            // the last compute program that did translate, so a missing translation stops the work rather than the
+            // boot. Enabled only by LEONIDA_STANDIN_PIPELINES, and the log says so every time.
+            static std::atomic<int> standin_logged{0};
+            if (standin_logged.fetch_add(1, std::memory_order_relaxed) < 3)
+                std::fprintf(stderr,
+                             "[rt] d3d12: STAND-IN compute pipeline: the program has no translation, so the module of "
+                             "%s is used; its dispatch will not do that program's work\n",
+                             last_compute_entry->name.c_str());
+            entry = last_compute_entry;
+        }
         if (!entry) {
             const bool fspx = program.kind == leonida::ComputeProgram::Kind::fspx;
             if (ambiguous)
@@ -4105,6 +4128,7 @@ public:
                              leonida::sha256_hex(program.bytes).c_str());
             return E_INVALIDARG;
         }
+        last_compute_entry = entry;
         // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, and a pipeline whose
         // shader declares bindings has it in its layout and has it bound at every dispatch.
         if (entry->binding_count && !device_.bindless) {
