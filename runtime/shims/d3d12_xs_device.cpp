@@ -1377,13 +1377,17 @@ std::uint64_t forward_device(DeviceProxy* self, std::uint64_t a1, std::uint64_t 
 // A device slot past the PC device's vtable (the real device predates the interface): E_NOTIMPL, logged once per
 // slot. The generic thunk and the slots the proxy handles itself (31/34/35/45/46/50, 75) log the same line.
 HRESULT refuse_beyond_device(unsigned slot, unsigned slot_count) {
+    // The console device vtable is longer than any PC one (the retail title calls slot 127, a one-argument method,
+    // from 45 sites). Those slots are console extensions with no PC counterpart, and refusing them aborts the title.
+    // Log the slot and answer success with a zero result, the same policy the frame-event slots already use: a boot
+    // must not abort on an extension the runtime does not model, and the log names every one that was stubbed.
     bool expected = false;
     if (slot < kMaxSlots && g_beyond_warned[slot].compare_exchange_strong(expected, true, std::memory_order_relaxed))
         std::fprintf(stderr,
-                     "[rt] d3d12_xs: device slot %u (%s) is beyond the PC device vtable (%u slots); returning "
-                     "E_NOTIMPL\n",
+                     "[rt] d3d12_xs: device slot %u (%s) is beyond the PC device vtable (%u slots); stubbed with "
+                     "S_OK / 0\n",
                      slot, slot_name(slot), slot_count);
-    return E_NOTIMPL;
+    return S_OK;
 }
 
 // Device slot 8: CreateCommandQueue(desc, riid, out). Without an output it is the device's own capability answer
