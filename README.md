@@ -23,16 +23,19 @@ Vulkan, and translates the console's shader corpus to SPIR-V. All of that works.
 | PE loader, TLS, heap, file system | working |
 | Xbox D3D12 → Vulkan device | working on an RTX 4090 (subgroup 32, bindless, Resizable BAR) |
 | Console DirectStorage | working (`DStorageGetFactory`, `IDStorageFactoryX::OpenFile`) |
-| **Retail boot** | **1,197 D3D12 calls**, then a host-side stop in the placed-resource path |
+| **Retail boot** | **2,238 D3D12 calls**, then a stop on a compute pipeline the translator cannot build yet |
 
 Every boot stop is documented with a measurement rather than a claim; the full ladder this fork started from is in
 [docs/retail_boot_chain.md](docs/retail_boot_chain.md), and all thirteen of its rows are cleared here.
 
 ### The current frontier
 
-Device slot 70 arrives as `(heap VA, offset, desc, …)` — the console names a heap by its address — and the layer
-reads a heap tag from that address. Needs a heap-VA → `Heap` mapping, and the console's resource description layout
-for this call.
+The run now reaches root-signature and compute-pipeline creation, then stops on the title's own null-pipeline call: every
+`DeserializeComputePipelineStateX` fails because the FidelityFX programs it names are among the 29 that do not all
+translate yet. 19 of them do. The ten that do not split into two measured classes — a scalar-register file wider than
+LLVM's model (which `tools/widen_smem_decode.py` repairs, and which recovered one program) and inline-literal encodings
+the disassembler prints canonically (open). [docs/boot_frontier.md](docs/boot_frontier.md) has the measurements and the
+method that produced them.
 
 ## Build
 
